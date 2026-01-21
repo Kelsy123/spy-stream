@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import date, timedelta
 import os
+print("✅ env keys include TRADIER_TOKEN?", "TRADIER_TOKEN" in os.environ, flush=True)
 
 import requests
 import websockets
@@ -62,9 +63,14 @@ def to_float(x):
         return None
 
 
+print("✅ run() entered", flush=True)
+print("✅ fetching previous session range...", flush=True)
+
 async def run():
     prev_high, prev_low, prev_date = get_previous_session_range(SYMBOL)
     print(f"Previous session ({prev_date}) high={prev_high} low={prev_low}")
+
+    print("✅ creating streaming session...", flush=True)
 
     sessionid = create_session_id()
     print("Session ID created")
@@ -123,4 +129,11 @@ async def run():
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except Exception as e:
+        import traceback
+        print("❌ Script crashed:", repr(e), flush=True)
+        traceback.print_exc()
+        raise
+
