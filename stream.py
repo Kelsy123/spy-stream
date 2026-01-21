@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import date, timedelta
 import os
+
 print("✅ env keys include TRADIER_TOKEN?", "TRADIER_TOKEN" in os.environ, flush=True)
 
 import requests
@@ -27,13 +28,23 @@ HEADERS = {
 }
 
 
-def create_session_id():
+def create_session_id() -> str:
+    print("✅ requesting Tradier sessionid...", flush=True)
     r = requests.post(SESSION_URL, headers=HEADERS, timeout=15)
+    print("✅ session endpoint status:", r.status_code, flush=True)
     r.raise_for_status()
-    return r.json()["stream"]["sessionid"]
+
+    data = r.json()
+    # This helps if Tradier ever returns a different shape
+    if "stream" not in data or "sessionid" not in data["stream"]:
+        raise RuntimeError(f"Unexpected session response: {data}")
+
+    sid = data["stream"]["sessionid"]
+    print("✅ got sessionid", flush=True)
+    return sid
 
 
-def get_previous_session_range(symbol):
+def get_previous_session_range(symbol: str):
     for back in range(1, 8):
         d = date.today() - timedelta(days=back)
         params = {
@@ -48,10 +59,7 @@ def get_previous_session_range(symbol):
         days = (data.get("history") or {}).get("day")
         if not days:
             continue
-        if isinstance(days, dict):
-            day = days
-        else:
-            day = days[0]
+        day = days if isinstance(days, dict) else days[0]
         return float(day["high"]), float(day["low"]), day["date"]
     raise RuntimeError("No previous session bar found")
 
@@ -59,21 +67,20 @@ def get_previous_session_range(symbol):
 def to_float(x):
     try:
         return float(x)
-    except:
+    except Exception:
         return None
 
 
-print("✅ run() entered", flush=True)
-print("✅ fetching previous session range...", flush=True)
-
 async def run():
+    print("✅ run() entered", flush=True)
+
+    print("✅ fetching previous session range...", flush=True)
     prev_high, prev_low, prev_date = get_previous_session_range(SYMBOL)
-    print(f"Previous session ({prev_date}) high={prev_high} low={prev_low}")
+    print(f"Previous session ({prev_date}) high={prev_high} low={prev_low}", flush=True)
 
     print("✅ creating streaming session...", flush=True)
-
     sessionid = create_session_id()
-    print("Session ID created")
+    print("✅ Session ID created", flush=True)
 
     rth_high = None
     rth_low = None
@@ -85,17 +92,22 @@ async def run():
         "filter": ["timesale"],
         "sessionid": sessionid,
         "linebreak": True,
-        "validOnly": True
+        "validOnly": True,
     }
 
+    print("✅ connecting to websocket...", flush=True)
     async with websockets.connect(WS_URL, ssl=True, compression=None) as ws:
+        print("✅ websocket connected", flush=True)
+
         await ws.send(json.dumps(sub_payload))
-        print("Subscribed to SPY timesales")
+        print("✅ Subscribed to SPY timesales", flush=True)
 
         async for message in ws:
             for line in message.splitlines():
-                if not line.strip():
+                line = line.strip()
+                if not line:
                     continue
+
                 event = json.loads(line)
                 if event.get("type") != "timesale":
                     continue
@@ -112,7 +124,7 @@ async def run():
                 prev_confirm = prev_confirm + 1 if outside_prev else 0
 
                 if prev_confirm == CONFIRM_TRADES:
-                    print(f"🚨 PREVIOUS RANGE BREAK: {last}  size={size}")
+                    print(f"🚨 PREVIOUS RANGE BREAK: {last}  size={size}", flush=True)
 
                 # ---- Track current RTH ----
                 if sess != "regular":
@@ -125,7 +137,7 @@ async def run():
                 curr_confirm = curr_confirm + 1 if outside_curr else 0
 
                 if curr_confirm == CONFIRM_TRADES:
-                    print(f"🚨 CURRENT RTH RANGE BREAK: {last}  size={size}")
+                    print(f"🚨 CURRENT RTH RANGE BREAK: {last}  size={size}", flush=True)
 
 
 if __name__ == "__main__":
@@ -136,4 +148,3 @@ if __name__ == "__main__":
         print("❌ Script crashed:", repr(e), flush=True)
         traceback.print_exc()
         raise
-
