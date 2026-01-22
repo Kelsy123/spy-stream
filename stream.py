@@ -2,10 +2,11 @@ print("✅ stream.py starting up...", flush=True)
 
 import asyncio
 import json
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
+from zoneinfo import ZoneInfo
 import os
 import time
-from typing import List, Tuple, Optional
+from typing import Optional, Tuple
 
 import requests
 import websockets
@@ -15,10 +16,10 @@ import websockets
 # =========================
 SYMBOL = "SPY"
 
-# Phantom-like anomaly threshold: dollars outside the previous session range
-PHANTOM_THRESHOLD = 1.00
+# Phantom detection: must be outside BOTH previous AND current range
+PHANTOM_THRESHOLD = 1.00  # dollars outside range to trigger
 
-# Current regular-session range break threshold (smaller makes sense)
+# Current regular-session range break threshold (for non-phantom breakouts)
 CURRENT_RANGE_BUFFER = 0.10
 
 # Cooldown (seconds) to avoid alert spam
@@ -28,15 +29,8 @@ RTH_COOLDOWN_SEC = 120       # 2 minutes
 # -------------------------
 # OPTIONAL: Watch exact levels
 # -------------------------
-# Turn this ON if you want to print whenever price trades near specific levels.
 ENABLE_WATCH = False
-
-# Example levels (edit these later if you want):
-WATCH_PRICES = [
-    # 670.29,
-]
-
-# How close price must be to count as a "hit"
+WATCH_PRICES = []  # Add specific prices like [670.29] if needed
 WATCH_TOLERANCE = 0.02  # 2 cents
 
 # =========================
@@ -53,6 +47,8 @@ HEADERS = {
     "Authorization": f"Bearer {TRADIER_TOKEN}",
     "Accept": "application/json",
 }
+
+ET = ZoneInfo("America/New_York")
 
 
 def create_session_id() -> str:
@@ -104,11 +100,6 @@ def to_float(x) -> Optional[float]:
         return None
 
 
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-ET = ZoneInfo("America/New_York")
-
 def ts_str() -> str:
     return datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S %Z")
 
@@ -131,7 +122,7 @@ async def run():
     # Cooldown timers
     last_phantom_alert_ts = 0.0
     last_rth_alert_ts = 0.0
-    last_watch_alert_ts = 0.0  # optional throttle for watch spam
+    last_watch_alert_ts = 0.0
 
     sub_payload = {
         "symbols": [SYMBOL],
@@ -154,7 +145,6 @@ async def run():
                 if not line:
                     continue
 
-                # Guard: Sometimes a non-JSON line can appear; skip instead of crashing
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
@@ -175,7 +165,6 @@ async def run():
                 # OPTIONAL: Watch exact levels
                 # =========================
                 if ENABLE_WATCH and WATCH_PRICES:
-                    # throttle watch logs a bit so you don't spam yourself
                     if now - last_watch_alert_ts >= 1.0:
                         for wp in WATCH_PRICES:
                             if abs(last - wp) <= WATCH_TOLERANCE:
@@ -188,16 +177,22 @@ async def run():
                                 break
 
                 # =========================
-                # PHANTOM detection vs PREVIOUS SESSION
-                # (single-trade trigger, no confirmations)
+                # PHANTOM PRINT DETECTION
+                # Must be outside BOTH previous range AND current RTH range
                 # =========================
-                outside_prev_by_phantom = (last > prev_high + PHANTOM_THRESHOLD) or (last < prev_low - PHANTOM_THRESHOLD)
+                outside_prev = (last > prev_high + PHANTOM_THRESHOLD) or (last < prev_low - PHANTOM_THRESHOLD)
+                
+                # Only flag as phantom if we have established an RTH range AND price is outside it too
+                is_phantom = False
+                if outside_prev and rth_high is not None and rth_low is not None:
+                    outside_current = (last > rth_high + PHANTOM_THRESHOLD) or (last < rth_low - PHANTOM_THRESHOLD)
+                    is_phantom = outside_current
 
-                if outside_prev_by_phantom and (now - last_phantom_alert_ts >= PHANTOM_COOLDOWN_SEC):
+                if is_phantom and (now - last_phantom_alert_ts >= PHANTOM_COOLDOWN_SEC):
                     last_phantom_alert_ts = now
                     print(
-                        f"🚨🚨 {ts_str()} OUTSIDE PREV RANGE: ${last} size={size} "
-                        f"prev_range=[{prev_low}, {prev_high}] session={sess}",
+                        f"🚨🚨 {ts_str()} PHANTOM PRINT DETECTED: ${last} size={size} session={sess} "
+                        f"prev_range=[{prev_low}, {prev_high}] rth_range=[{rth_low}, {rth_high}]",
                         flush=True
                     )
 
@@ -205,11 +200,12 @@ async def run():
                 # CURRENT RTH range tracking (regular session only)
                 # =========================
                 if sess == "regular":
-                    # Check break BEFORE updating range
+                    # Check for legitimate RTH range breakout
                     if rth_high is not None and rth_low is not None:
                         outside_curr = (last > rth_high + CURRENT_RANGE_BUFFER) or (last < rth_low - CURRENT_RANGE_BUFFER)
 
-                        if outside_curr and (now - last_rth_alert_ts >= RTH_COOLDOWN_SEC):
+                        # Only alert if it's NOT a phantom (already alerted above)
+                        if outside_curr and not is_phantom and (now - last_rth_alert_ts >= RTH_COOLDOWN_SEC):
                             last_rth_alert_ts = now
                             print(
                                 f"🚨 {ts_str()} CURRENT RTH RANGE BREAK: ${last} size={size} "
@@ -230,4 +226,3 @@ if __name__ == "__main__":
         print("❌ Script crashed:", repr(e), flush=True)
         traceback.print_exc()
         raise
-
