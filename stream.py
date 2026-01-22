@@ -104,9 +104,13 @@ def to_float(x) -> Optional[float]:
         return None
 
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
+
 def ts_str() -> str:
-    # Simple local timestamp string for log readability
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 async def run():
