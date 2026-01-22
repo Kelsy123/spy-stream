@@ -5,6 +5,7 @@ import json
 from datetime import date, timedelta
 import os
 import time
+from typing import List, Tuple, Optional
 
 import requests
 import websockets
@@ -23,6 +24,20 @@ CURRENT_RANGE_BUFFER = 0.10
 # Cooldown (seconds) to avoid alert spam
 PHANTOM_COOLDOWN_SEC = 120   # 2 minutes
 RTH_COOLDOWN_SEC = 120       # 2 minutes
+
+# -------------------------
+# OPTIONAL: Watch exact levels
+# -------------------------
+# Turn this ON if you want to print whenever price trades near specific levels.
+ENABLE_WATCH = False
+
+# Example levels (edit these later if you want):
+WATCH_PRICES = [
+    # 670.29,
+]
+
+# How close price must be to count as a "hit"
+WATCH_TOLERANCE = 0.02  # 2 cents
 
 # =========================
 # Env / Tradier endpoints
@@ -55,7 +70,7 @@ def create_session_id() -> str:
     return sid
 
 
-def get_previous_session_range(symbol: str):
+def get_previous_session_range(symbol: str) -> Tuple[float, float, str]:
     """
     Finds the most recent prior trading day daily bar (search back up to 7 calendar days).
     Returns (high, low, date_str).
@@ -82,11 +97,16 @@ def get_previous_session_range(symbol: str):
     raise RuntimeError("No previous session bar found (tried last 7 days)")
 
 
-def to_float(x):
+def to_float(x) -> Optional[float]:
     try:
         return float(x)
     except Exception:
         return None
+
+
+def ts_str() -> str:
+    # Simple local timestamp string for log readability
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 async def run():
@@ -107,6 +127,7 @@ async def run():
     # Cooldown timers
     last_phantom_alert_ts = 0.0
     last_rth_alert_ts = 0.0
+    last_watch_alert_ts = 0.0  # optional throttle for watch spam
 
     sub_payload = {
         "symbols": [SYMBOL],
@@ -129,7 +150,12 @@ async def run():
                 if not line:
                     continue
 
-                event = json.loads(line)
+                # Guard: Sometimes a non-JSON line can appear; skip instead of crashing
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
                 if event.get("type") != "timesale":
                     continue
 
@@ -139,20 +165,23 @@ async def run():
 
                 size = event.get("size")
                 sess = event.get("session")
-
                 now = time.time()
 
                 # =========================
-                # Optional: Watch exact levels
+                # OPTIONAL: Watch exact levels
                 # =========================
-                if ENABLE_WATCH:
-                    for wp in WATCH_PRICES:
-                        if abs(last - wp) <= WATCH_TOLERANCE:
-                            print(
-                                f"👀 WATCH HIT: last={last} size={size} session={sess} raw={event}",
-                                flush=True
-                            )
-                            break
+                if ENABLE_WATCH and WATCH_PRICES:
+                    # throttle watch logs a bit so you don't spam yourself
+                    if now - last_watch_alert_ts >= 1.0:
+                        for wp in WATCH_PRICES:
+                            if abs(last - wp) <= WATCH_TOLERANCE:
+                                last_watch_alert_ts = now
+                                print(
+                                    f"👀 {ts_str()} WATCH HIT: last={last} size={size} session={sess} "
+                                    f"tolerance=±{WATCH_TOLERANCE} level={wp}",
+                                    flush=True
+                                )
+                                break
 
                 # =========================
                 # PHANTOM detection vs PREVIOUS SESSION
@@ -163,7 +192,7 @@ async def run():
                 if outside_prev_by_phantom and (now - last_phantom_alert_ts >= PHANTOM_COOLDOWN_SEC):
                     last_phantom_alert_ts = now
                     print(
-                        f"🚨🚨 PHANTOM PRINT DETECTED: ${last}  size={size}  "
+                        f"🚨🚨 {ts_str()} PHANTOM PRINT DETECTED: ${last} size={size} "
                         f"prev_range=[{prev_low}, {prev_high}] session={sess}",
                         flush=True
                     )
@@ -179,7 +208,7 @@ async def run():
                         if outside_curr and (now - last_rth_alert_ts >= RTH_COOLDOWN_SEC):
                             last_rth_alert_ts = now
                             print(
-                                f"🚨 CURRENT RTH RANGE BREAK: ${last} size={size} "
+                                f"🚨 {ts_str()} CURRENT RTH RANGE BREAK: ${last} size={size} "
                                 f"rth_range=[{rth_low}, {rth_high}]",
                                 flush=True
                             )
@@ -197,3 +226,4 @@ if __name__ == "__main__":
         print("❌ Script crashed:", repr(e), flush=True)
         traceback.print_exc()
         raise
+
