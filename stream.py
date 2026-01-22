@@ -4,19 +4,31 @@ import asyncio
 import json
 from datetime import date, timedelta
 import os
-
-print("✅ env keys include TRADIER_TOKEN?", "TRADIER_TOKEN" in os.environ, flush=True)
+import time
 
 import requests
 import websockets
 
-# ===== Environment Variables =====
-TRADIER_TOKEN = os.environ["TRADIER_TOKEN"]
+# =========================
+# Settings
+# =========================
 SYMBOL = "SPY"
 
-PREV_RANGE_BUFFER = 0.10
+# Phantom-like anomaly threshold: dollars outside the previous session range
+PHANTOM_THRESHOLD = 1.00
+
+# Current regular-session range break threshold (smaller makes sense)
 CURRENT_RANGE_BUFFER = 0.10
-CONFIRM_TRADES = 3
+
+# Cooldown (seconds) to avoid alert spam
+PHANTOM_COOLDOWN_SEC = 120   # 2 minutes
+RTH_COOLDOWN_SEC = 120       # 2 minutes
+
+# =========================
+# Env / Tradier endpoints
+# =========================
+print("✅ env keys include TRADIER_TOKEN?", "TRADIER_TOKEN" in os.environ, flush=True)
+TRADIER_TOKEN = os.environ["TRADIER_TOKEN"]
 
 SESSION_URL = "https://api.tradier.com/v1/markets/events/session"
 WS_URL = "wss://ws.tradier.com/v1/markets/events"
@@ -35,7 +47,6 @@ def create_session_id() -> str:
     r.raise_for_status()
 
     data = r.json()
-    # This helps if Tradier ever returns a different shape
     if "stream" not in data or "sessionid" not in data["stream"]:
         raise RuntimeError(f"Unexpected session response: {data}")
 
@@ -45,6 +56,10 @@ def create_session_id() -> str:
 
 
 def get_previous_session_range(symbol: str):
+    """
+    Finds the most recent prior trading day daily bar (search back up to 7 calendar days).
+    Returns (high, low, date_str).
+    """
     for back in range(1, 8):
         d = date.today() - timedelta(days=back)
         params = {
@@ -56,12 +71,15 @@ def get_previous_session_range(symbol: str):
         r = requests.get(HISTORY_URL, headers=HEADERS, params=params, timeout=15)
         r.raise_for_status()
         data = r.json()
+
         days = (data.get("history") or {}).get("day")
         if not days:
             continue
+
         day = days if isinstance(days, dict) else days[0]
         return float(day["high"]), float(day["low"]), day["date"]
-    raise RuntimeError("No previous session bar found")
+
+    raise RuntimeError("No previous session bar found (tried last 7 days)")
 
 
 def to_float(x):
@@ -82,10 +100,13 @@ async def run():
     sessionid = create_session_id()
     print("✅ Session ID created", flush=True)
 
+    # Current regular-session range tracking
     rth_high = None
     rth_low = None
-    prev_confirm = 0
-    curr_confirm = 0
+
+    # Cooldown timers
+    last_phantom_alert_ts = 0.0
+    last_rth_alert_ts = 0.0
 
     sub_payload = {
         "symbols": [SYMBOL],
@@ -119,25 +140,53 @@ async def run():
                 size = event.get("size")
                 sess = event.get("session")
 
-                # ---- Outside previous session ----
-                outside_prev = (last > prev_high + PREV_RANGE_BUFFER) or (last < prev_low - PREV_RANGE_BUFFER)
-                prev_confirm = prev_confirm + 1 if outside_prev else 0
+                now = time.time()
 
-                if prev_confirm == CONFIRM_TRADES:
-                    print(f"🚨 PREVIOUS RANGE BREAK: {last}  size={size}", flush=True)
+                # =========================
+                # Optional: Watch exact levels
+                # =========================
+                if ENABLE_WATCH:
+                    for wp in WATCH_PRICES:
+                        if abs(last - wp) <= WATCH_TOLERANCE:
+                            print(
+                                f"👀 WATCH HIT: last={last} size={size} session={sess} raw={event}",
+                                flush=True
+                            )
+                            break
 
-                # ---- Track current RTH ----
-                if sess != "regular":
-                    continue
+                # =========================
+                # PHANTOM detection vs PREVIOUS SESSION
+                # (single-trade trigger, no confirmations)
+                # =========================
+                outside_prev_by_phantom = (last > prev_high + PHANTOM_THRESHOLD) or (last < prev_low - PHANTOM_THRESHOLD)
 
-                rth_low = last if rth_low is None else min(rth_low, last)
-                rth_high = last if rth_high is None else max(rth_high, last)
+                if outside_prev_by_phantom and (now - last_phantom_alert_ts >= PHANTOM_COOLDOWN_SEC):
+                    last_phantom_alert_ts = now
+                    print(
+                        f"🚨🚨 PHANTOM PRINT DETECTED: ${last}  size={size}  "
+                        f"prev_range=[{prev_low}, {prev_high}] session={sess}",
+                        flush=True
+                    )
 
-                outside_curr = (last > rth_high + CURRENT_RANGE_BUFFER) or (last < rth_low - CURRENT_RANGE_BUFFER)
-                curr_confirm = curr_confirm + 1 if outside_curr else 0
+                # =========================
+                # CURRENT RTH range tracking (regular session only)
+                # =========================
+                if sess == "regular":
+                    # Check break BEFORE updating range
+                    if rth_high is not None and rth_low is not None:
+                        outside_curr = (last > rth_high + CURRENT_RANGE_BUFFER) or (last < rth_low - CURRENT_RANGE_BUFFER)
 
-                if curr_confirm == CONFIRM_TRADES:
-                    print(f"🚨 CURRENT RTH RANGE BREAK: {last}  size={size}", flush=True)
+                        if outside_curr and (now - last_rth_alert_ts >= RTH_COOLDOWN_SEC):
+                            last_rth_alert_ts = now
+                            print(
+                                f"🚨 CURRENT RTH RANGE BREAK: ${last} size={size} "
+                                f"rth_range=[{rth_low}, {rth_high}]",
+                                flush=True
+                            )
+
+                    # Update RTH range normally
+                    rth_low = last if rth_low is None else min(rth_low, last)
+                    rth_high = last if rth_high is None else max(rth_high, last)
 
 
 if __name__ == "__main__":
