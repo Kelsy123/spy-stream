@@ -57,12 +57,16 @@ def get_previous_session_range(symbol: str) -> Tuple[float, float, str]:
         end_date = date.today() - timedelta(days=days_back)
         start_date = end_date - timedelta(days=1)
         
+        # Convert date to datetime for timestamp() method
+        end_datetime = datetime.combine(end_date, datetime.min.time())
+        start_datetime = datetime.combine(start_date, datetime.min.time())
+        
         # Yahoo Finance URL format
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
         params = {
             "interval": "1d",
-            "period1": int(start_date.timestamp()),
-            "period2": int(end_date.timestamp()),
+            "period1": int(start_datetime.timestamp()),
+            "period2": int(end_datetime.timestamp()),
         }
         
         try:
