@@ -227,22 +227,30 @@ async def run():
 
                 # =========================
                 # PHANTOM PRINT DETECTION
-                # Must be outside BOTH previous range AND current RTH range
+                # Must be SIGNIFICANTLY outside BOTH previous AND current range
+                # Use larger threshold for phantom detection vs normal range breaks
                 # =========================
+                
+                # Check if outside previous session range
                 outside_prev = (last > prev_high + PHANTOM_THRESHOLD) or (last < prev_low - PHANTOM_THRESHOLD)
                 
-                # Only flag as phantom if we have established an RTH range AND price is outside it too
+                # Only flag as phantom if we have established an RTH range AND price is WAY outside it
                 is_phantom = False
                 if outside_prev and rth_high is not None and rth_low is not None:
-                    outside_current = (last > rth_high + PHANTOM_THRESHOLD) or (last < rth_low - PHANTOM_THRESHOLD)
-                    is_phantom = outside_current
+                    # For phantom detection, require a BIGGER gap from current range
+                    # This filters out normal breakouts that gradually expand the range
+                    phantom_gap_threshold = max(PHANTOM_THRESHOLD, (rth_high - rth_low) * 0.5)  # At least 50% of current range
+                    
+                    outside_current_far = (last > rth_high + phantom_gap_threshold) or (last < rth_low - phantom_gap_threshold)
+                    is_phantom = outside_current_far
 
                 if is_phantom and (now - last_phantom_alert_ts >= PHANTOM_COOLDOWN_SEC):
                     last_phantom_alert_ts = now
+                    distance_from_range = min(abs(last - rth_high), abs(last - rth_low))
                     print(
                         f"🚨🚨 {ts_str()} PHANTOM PRINT DETECTED: ${last} size={size} "
                         f"prev_range=[{prev_low}, {prev_high}] rth_range=[{rth_low}, {rth_high}] "
-                        f"conditions={conditions} exchange={exchange}",
+                        f"distance=${distance_from_range:.2f} conditions={conditions} exchange={exchange}",
                         flush=True
                     )
 
@@ -263,9 +271,30 @@ async def run():
                                 flush=True
                             )
 
-                    # Update RTH range normally
-                    rth_low = last if rth_low is None else min(rth_low, last)
-                    rth_high = last if rth_high is None else max(rth_high, last)
+                    # Update RTH range - BUT NOT if this looks like a phantom print
+                    # Only update if the move is reasonable (not a massive gap)
+                    current_range = rth_high - rth_low if rth_high and rth_low else 0
+                    max_reasonable_move = max(2.0, current_range * 1.5)  # Max 1.5x current range or $2
+                    
+                    if rth_high is None or rth_low is None:
+                        # First trades of the day - always accept
+                        rth_low = last
+                        rth_high = last
+                    elif not is_phantom:
+                        # Only update range if move is reasonable
+                        distance_from_range = max(0, last - rth_high, rth_low - last)
+                        
+                        if distance_from_range <= max_reasonable_move:
+                            # Normal move - update range
+                            rth_low = min(rth_low, last)
+                            rth_high = max(rth_high, last)
+                        else:
+                            # Suspicious move - don't update range, but log it
+                            print(
+                                f"⚠️ {ts_str()} SUSPICIOUS MOVE (not updating range): ${last} "
+                                f"distance=${distance_from_range:.2f} max_reasonable=${max_reasonable_move:.2f}",
+                                flush=True
+                            )
 
 
 if __name__ == "__main__":
