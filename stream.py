@@ -1,300 +1,260 @@
-print("✅ stream.py starting up...", flush=True)
+print("✅ stream.py starting...", flush=True)
 
 import asyncio
 import json
-from datetime import date, timedelta, datetime, time
-from zoneinfo import ZoneInfo
 import os
+import requests
+import websockets
+from datetime import datetime, date, timedelta, time
+from zoneinfo import ZoneInfo
 import time as time_module
 from typing import Optional, Tuple
 
-import requests
-import websockets
+# =========================
+# SETTINGS
+# =========================
 
-# =========================
-# Settings
-# =========================
 SYMBOL = "SPY"
 
-# Phantom detection: must be outside BOTH previous AND current range
-PHANTOM_THRESHOLD = 1.00  # dollars outside range to trigger
+ET = ZoneInfo("America/New_York")
+WS_URL = "wss://socket.massive.com/stocks"
+MASSIVE_API_KEY = os.environ["MASSIVE_API_KEY"]
 
-# Current regular-session range break threshold (for non-phantom breakouts)
-CURRENT_RANGE_BUFFER = 0.10
+# Phantom detection thresholds
+PHANTOM_OUTSIDE_PREV = 1.00      # Must be $1 outside previous day range
+PHANTOM_OUTSIDE_RTH_MULT = 0.50  # Must be 50% outside current day’s range
 
-# Cooldown (seconds) to avoid alert spam
-PHANTOM_COOLDOWN_SEC = 120   # 2 minutes
-RTH_COOLDOWN_SEC = 120       # 2 minutes
+# Normal RTH breakout buffer
+RTH_BREAK_BUFFER = 0.10
 
-# -------------------------
-# OPTIONAL: Watch exact levels
-# -------------------------
-ENABLE_WATCH = False
-WATCH_PRICES = []  # Add specific prices like [670.29] if needed
-WATCH_TOLERANCE = 0.02  # 2 cents
+# Alert cooldowns
+PHANTOM_COOLDOWN = 120
+RTH_COOLDOWN = 120
 
-# -------------------------
-# Trade filtering options
-# -------------------------
-# Log ALL trades for debugging (set to True to see every trade)
+# Debug logging
 LOG_ALL_TRADES = False
 
-# Suspicious trade conditions to flag (from Massive's glossary)
-# These often indicate irregular trades that might be phantoms
-SUSPICIOUS_CONDITIONS = {
-    14,  # Odd lot trade
-    37,  # Intermarket sweep
-    41,  # Derivatively priced
+
+# =========================
+# SIP CONDITION FILTERING
+# =========================
+
+# These conditions are normal and should be ignored.
+IGNORE_CONDITIONS = {
+    0, 37,    # Regular sale
+    14,       # Auction/cross/official event
+    41,       # Derivatively priced
+    4, 9, 19, # Out-of-sequence / corrected
+    53, 12,   # Odd lot / odd-lot cross
+    1,        # Extended hours
 }
 
-# Alert on unusual trade sizes
-MIN_SUSPICIOUS_SIZE = 1      # Trades smaller than this
-MAX_SUSPICIOUS_SIZE = 50000  # Trades larger than this
+# These conditions indicate potentially interesting off-book behavior.
+PHANTOM_RELEVANT_CONDITIONS = {
+    2,  # Special price
+    3,  # Special sale
+    7,  # Qualified contingent trade
+    8,  # Trade through exempt
+    16, # Market center open
+    17, # Market center close
+    20, # Market center move
+    21, # Market center token
+    22, # Market center price shift
+    62, # Cross trade (TRF)
+}
+
 
 # =========================
-# Massive.io API Configuration
+# HELPERS
 # =========================
-print("✅ env keys include MASSIVE_API_KEY?", "MASSIVE_API_KEY" in os.environ, flush=True)
-MASSIVE_API_KEY = os.environ["MASSIVE_API_KEY"]  # Set this in Railway environment variables
 
-# Massive WebSocket endpoint - Real-time feed
-WS_URL = "wss://socket.massive.com/stocks"
+def to_float(x):
+    try:
+        return float(x)
+    except:
+        return None
 
-ET = ZoneInfo("America/New_York")
+
+def ts_str():
+    return datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def get_previous_session_range(symbol: str) -> Tuple[float, float, str]:
     """
-    Fetches the most recent prior trading day from Massive's own API.
+    Get previous day's high/low using Massive aggregates.
     Falls back to manual range if API fails.
-    Returns (high, low, date_str).
     """
-    print("✅ fetching previous session range from Massive API...", flush=True)
-    
-    # Try Massive's aggregates endpoint for previous day
+    print("Fetching previous session range...", flush=True)
+
     try:
-        # Get data for last 5 days to ensure we get a complete trading day
         end_date = date.today()
         start_date = end_date - timedelta(days=5)
-        
-        url = f"https://api.massive.io/v1/stocks/aggregates/{symbol}/range/1/day/{start_date.isoformat()}/{end_date.isoformat()}"
+
+        url = (
+            f"https://api.massive.io/v1/stocks/aggregates/{symbol}/range/"
+            f"1/day/{start_date}/{end_date}"
+        )
         headers = {"Authorization": f"Bearer {MASSIVE_API_KEY}"}
-        
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            results = data.get("results", [])
-            
-            # Get the second-to-last day (most recent complete day)
-            if len(results) >= 2:
-                prev_day = results[-2]  # -1 might be today (incomplete), so use -2
-                prev_high = float(prev_day["h"])
-                prev_low = float(prev_day["l"])
-                prev_timestamp = prev_day["t"]
-                prev_date = datetime.fromtimestamp(prev_timestamp / 1000).strftime("%Y-%m-%d")
-                
-                print(f"✅ Found previous session: {prev_date} high={prev_high} low={prev_low}", flush=True)
-                return prev_high, prev_low, prev_date
-                
-        print(f"⚠️ Massive API returned status {response.status_code}", flush=True)
-                
+
+        r = requests.get(url, headers=headers, timeout=10)
+
+        if r.status_code == 200:
+            data = r.json().get("results", [])
+            if len(data) >= 2:
+                prev = data[-2]
+                high = float(prev["h"])
+                low = float(prev["l"])
+                dstr = datetime.fromtimestamp(prev["t"]/1000).strftime("%Y-%m-%d")
+
+                print(f"Previous session: {dstr} high={high} low={low}", flush=True)
+                return high, low, dstr
+
+        print(f"⚠️ Massive returned {r.status_code}, using fallback.", flush=True)
+
     except Exception as e:
-        print(f"⚠️ Massive API fetch failed: {e}", flush=True)
-    
-    # Fallback: Use current SPY approximate range based on recent trading
-    print("⚠️ API fetch failed, using conservative fallback range", flush=True)
-    prev_date = (date.today() - timedelta(days=1)).isoformat()
-    
-    # Based on current market conditions (SPY ~692), set reasonable bounds
-    # These are intentionally wide to avoid false positives
-    prev_high = 695.0  # Update manually if needed
-    prev_low = 685.0   # Update manually if needed
-    
-    print(f"⚠️ Using fallback range: {prev_date} high={prev_high} low={prev_low}", flush=True)
-    print("⚠️ WARNING: Manual range in use - update these values or fix API!", flush=True)
-    
-    return prev_high, prev_low, prev_date
+        print(f"⚠️ API error: {e}", flush=True)
+
+    # Fallback (safe wide range)
+    fallback_date = (date.today() - timedelta(days=1)).isoformat()
+    return 695.0, 685.0, fallback_date
 
 
-def to_float(x) -> Optional[float]:
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-
-def ts_str() -> str:
-    return datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S %Z")
-
+# =========================
+# MAIN RUNTIME
+# =========================
 
 async def run():
-    print("✅ run() entered", flush=True)
+    print("Starting main loop...", flush=True)
 
-    print("✅ fetching previous session range...", flush=True)
     prev_high, prev_low, prev_date = get_previous_session_range(SYMBOL)
-    print(f"Previous session ({prev_date}) high={prev_high} low={prev_low}", flush=True)
 
-    # Current regular-session range tracking
     rth_high = None
     rth_low = None
 
-    # Cooldown timers
-    last_phantom_alert_ts = 0.0
-    last_rth_alert_ts = 0.0
-    last_watch_alert_ts = 0.0
+    last_phantom_alert = 0
+    last_rth_alert = 0
 
-    print("✅ connecting to Massive websocket...", flush=True)
-    
     async with websockets.connect(WS_URL) as ws:
-        print("✅ websocket connected", flush=True)
 
-        # Step 1: Authenticate with API key
-        auth_msg = {"action": "auth", "params": MASSIVE_API_KEY}
-        await ws.send(json.dumps(auth_msg))
-        print("✅ Authentication message sent", flush=True)
-        
-        # Wait for auth confirmation
-        auth_response = await ws.recv()
-        print(f"✅ Auth response: {auth_response}", flush=True)
+        # Authenticate
+        await ws.send(json.dumps({"action": "auth", "params": MASSIVE_API_KEY}))
+        print("Sent auth...", flush=True)
+        print("Auth response:", await ws.recv(), flush=True)
 
-        # Step 2: Subscribe to SPY trades
-        subscribe_msg = {"action": "subscribe", "params": f"T.{SYMBOL}"}
-        await ws.send(json.dumps(subscribe_msg))
-        print(f"✅ Subscribed to {SYMBOL} trades", flush=True)
+        # Subscribe to SPY trades
+        await ws.send(json.dumps({"action": "subscribe", "params": f"T.{SYMBOL}"}))
+        print(f"Subscribed to {SYMBOL}", flush=True)
 
-        # Process incoming messages
-        async for message in ws:
+        async for raw in ws:
             try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
+                msg = json.loads(raw)
+            except:
                 continue
 
-            # Handle array of events or single event
-            events = data if isinstance(data, list) else [data]
-            
-            for event in events:
-                # Massive trade format: {"ev":"T","sym":"SPY","p":686.50,"s":100,"t":1234567890000,"c":[...]}
-                if event.get("ev") != "T":  # T = Trade
+            events = msg if isinstance(msg, list) else [msg]
+
+            for e in events:
+                if e.get("ev") != "T":
                     continue
-                
-                last = to_float(event.get("p"))  # price
-                if last is None:
+
+                price = to_float(e.get("p"))
+                if price is None:
                     continue
-                
-                size = event.get("s", 0)  # size
-                timestamp = event.get("t", 0)  # timestamp in milliseconds
-                conditions = event.get("c", [])  # trade conditions
-                exchange = event.get("x")  # exchange ID
-                now = time_module.time()
-                
-                # Log trade details for debugging
+
+                size = e.get("s", 0)
+                conds = e.get("c", [])
+                exch = e.get("x")
+                timestamp = e.get("t", 0)
+
                 if LOG_ALL_TRADES:
-                    print(f"📊 Trade: ${last} size={size} conditions={conditions} exchange={exchange}", flush=True)
-                
-                # Flag suspicious trade characteristics
-                has_suspicious_condition = any(c in SUSPICIOUS_CONDITIONS for c in conditions)
-                has_unusual_size = size < MIN_SUSPICIOUS_SIZE or size > MAX_SUSPICIOUS_SIZE
-                
-                if has_suspicious_condition or has_unusual_size:
-                    print(
-                        f"⚠️ {ts_str()} UNUSUAL TRADE: ${last} size={size} "
-                        f"conditions={conditions} exchange={exchange}",
-                        flush=True
-                    )
-                
-                # Determine if this is regular trading hours (9:30 AM - 4:00 PM ET)
-                trade_time = datetime.fromtimestamp(timestamp / 1000, tz=ET)
-                is_regular_hours = (
-                    trade_time.weekday() < 5 and  # Monday-Friday
-                    time(9, 30) <= trade_time.time() <= time(16, 0)
+                    print(f"TRADE: {price} size={size} cond={conds} exch={exch}")
+
+                # Filter by time
+                tm = datetime.fromtimestamp(timestamp/1000, tz=ET)
+                is_rth = (
+                    tm.weekday() < 5 and
+                    time(9, 30) <= tm.time() <= time(16, 0)
                 )
-                
-                # =========================
-                # OPTIONAL: Watch exact levels
-                # =========================
-                if ENABLE_WATCH and WATCH_PRICES:
-                    if now - last_watch_alert_ts >= 1.0:
-                        for wp in WATCH_PRICES:
-                            if abs(last - wp) <= WATCH_TOLERANCE:
-                                last_watch_alert_ts = now
-                                print(
-                                    f"👀 {ts_str()} WATCH HIT: last={last} size={size} "
-                                    f"tolerance=±{WATCH_TOLERANCE} level={wp}",
-                                    flush=True
-                                )
-                                break
 
-                # =========================
-                # PHANTOM PRINT DETECTION
-                # Must be SIGNIFICANTLY outside BOTH previous AND current range
-                # Use larger threshold for phantom detection vs normal range breaks
-                # =========================
-                
-                # Check if outside previous session range
-                outside_prev = (last > prev_high + PHANTOM_THRESHOLD) or (last < prev_low - PHANTOM_THRESHOLD)
-                
-                # Only flag as phantom if we have established an RTH range AND price is WAY outside it
-                is_phantom = False
-                if outside_prev and rth_high is not None and rth_low is not None:
-                    # For phantom detection, require a BIGGER gap from current range
-                    # This filters out normal breakouts that gradually expand the range
-                    phantom_gap_threshold = max(PHANTOM_THRESHOLD, (rth_high - rth_low) * 0.5)  # At least 50% of current range
-                    
-                    outside_current_far = (last > rth_high + phantom_gap_threshold) or (last < rth_low - phantom_gap_threshold)
-                    is_phantom = outside_current_far
+                # ------------------------------------
+                # 1. Determine if this trade is phantom-relevant
+                # ------------------------------------
 
-                if is_phantom and (now - last_phantom_alert_ts >= PHANTOM_COOLDOWN_SEC):
-                    last_phantom_alert_ts = now
-                    distance_from_range = min(abs(last - rth_high), abs(last - rth_low))
+                # Must be FINRA (TRF) off-exchange
+                is_darkpool_source = (exch == 4)
+
+                # Check condition filters
+                cond_is_ok = (
+                    any(c in PHANTOM_RELEVANT_CONDITIONS for c in conds)
+                    and not any(c in IGNORE_CONDITIONS for c in conds)
+                )
+
+                outside_prev = (
+                    price > prev_high + PHANTOM_OUTSIDE_PREV or
+                    price < prev_low - PHANTOM_OUTSIDE_PREV
+                )
+
+                # Need current RTH range
+                has_range = (rth_high is not None and rth_low is not None)
+
+                if has_range:
+                    current_range = rth_high - rth_low
+                    phantom_gap = max(PHANTOM_OUTSIDE_PREV,
+                                      current_range * PHANTOM_OUTSIDE_RTH_MULT)
+
+                    outside_rth_far = (
+                        price > rth_high + phantom_gap or
+                        price < rth_low - phantom_gap
+                    )
+                else:
+                    outside_rth_far = False
+
+                # Final phantom decision
+                is_phantom = (
+                    is_darkpool_source and
+                    cond_is_ok and
+                    outside_prev and
+                    outside_rth_far
+                )
+
+                now = time_module.time()
+
+                if is_phantom and now - last_phantom_alert > PHANTOM_COOLDOWN:
+                    last_phantom_alert = now
                     print(
-                        f"🚨🚨 {ts_str()} PHANTOM PRINT DETECTED: ${last} size={size} "
-                        f"prev_range=[{prev_low}, {prev_high}] rth_range=[{rth_low}, {rth_high}] "
-                        f"distance=${distance_from_range:.2f} conditions={conditions} exchange={exchange}",
+                        f"🚨🚨 {ts_str()} PHANTOM PRINT DETECTED ${price} size={size} "
+                        f"prev=[{prev_low},{prev_high}] rth=[{rth_low},{rth_high}] "
+                        f"conds={conds} exch={exch}",
                         flush=True
                     )
 
-                # =========================
-                # CURRENT RTH range tracking (regular session only)
-                # =========================
-                if is_regular_hours:
-                    # Check for legitimate RTH range breakout
-                    if rth_high is not None and rth_low is not None:
-                        outside_curr = (last > rth_high + CURRENT_RANGE_BUFFER) or (last < rth_low - CURRENT_RANGE_BUFFER)
-
-                        # Only alert if it's NOT a phantom (already alerted above)
-                        if outside_curr and not is_phantom and (now - last_rth_alert_ts >= RTH_COOLDOWN_SEC):
-                            last_rth_alert_ts = now
+                # ------------------------------------
+                # 2. Normal RTH breakout alert
+                # ------------------------------------
+                if is_rth and has_range:
+                    if (
+                        price > rth_high + RTH_BREAK_BUFFER or
+                        price < rth_low - RTH_BREAK_BUFFER
+                    ):
+                        if not is_phantom and now - last_rth_alert > RTH_COOLDOWN:
+                            last_rth_alert = now
                             print(
-                                f"🚨 {ts_str()} CURRENT RTH RANGE BREAK: ${last} size={size} "
-                                f"rth_range=[{rth_low}, {rth_high}]",
+                                f"🚨 {ts_str()} RTH BREAKOUT {price} rth=[{rth_low},{rth_high}]",
                                 flush=True
                             )
 
-                    # Update RTH range - BUT NOT if this looks like a phantom print
-                    # Only update if the move is reasonable (not a massive gap)
-                    current_range = rth_high - rth_low if rth_high and rth_low else 0
-                    max_reasonable_move = max(2.0, current_range * 1.5)  # Max 1.5x current range or $2
-                    
-                    if rth_high is None or rth_low is None:
-                        # First trades of the day - always accept
-                        rth_low = last
-                        rth_high = last
-                    elif not is_phantom:
-                        # Only update range if move is reasonable
-                        distance_from_range = max(0, last - rth_high, rth_low - last)
-                        
-                        if distance_from_range <= max_reasonable_move:
-                            # Normal move - update range
-                            rth_low = min(rth_low, last)
-                            rth_high = max(rth_high, last)
-                        else:
-                            # Suspicious move - don't update range, but log it
-                            print(
-                                f"⚠️ {ts_str()} SUSPICIOUS MOVE (not updating range): ${last} "
-                                f"distance=${distance_from_range:.2f} max_reasonable=${max_reasonable_move:.2f}",
-                                flush=True
-                            )
+                # ------------------------------------
+                # 3. Update RTH range sanely
+                # ------------------------------------
+                if is_rth:
+                    if rth_high is None:
+                        rth_low = price
+                        rth_high = price
+                    else:
+                        # Do not update range if the trade is phantom or absurd
+                        if not is_phantom:
+                            rth_low = min(rth_low, price)
+                            rth_high = max(rth_high, price)
 
 
 if __name__ == "__main__":
@@ -302,6 +262,6 @@ if __name__ == "__main__":
         asyncio.run(run())
     except Exception as e:
         import traceback
-        print("❌ Script crashed:", repr(e), flush=True)
+        print("❌ Crash:", e)
         traceback.print_exc()
         raise
