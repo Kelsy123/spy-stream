@@ -2,10 +2,10 @@ print("✅ stream.py starting up...", flush=True)
 
 import asyncio
 import json
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta, datetime, time
 from zoneinfo import ZoneInfo
 import os
-import time
+import time as time_module
 from typing import Optional, Tuple
 
 import requests
@@ -39,8 +39,8 @@ WATCH_TOLERANCE = 0.02  # 2 cents
 print("✅ env keys include MASSIVE_API_KEY?", "MASSIVE_API_KEY" in os.environ, flush=True)
 MASSIVE_API_KEY = os.environ["MASSIVE_API_KEY"]  # Set this in Railway environment variables
 
-# Massive WebSocket endpoint
-WS_URL = "wss://api.massive.io/v1/stream"
+# Massive WebSocket endpoint - Real-time feed
+WS_URL = "wss://socket.massive.com/stocks"
 
 ET = ZoneInfo("America/New_York")
 
@@ -126,126 +126,108 @@ async def run():
 
     print("✅ connecting to Massive websocket...", flush=True)
     
-    # Massive WebSocket connection with authentication
-    headers = {
-        "Authorization": f"Bearer {MASSIVE_API_KEY}"
-    }
-    
-    async with websockets.connect(WS_URL, extra_headers=headers) as ws:
+    async with websockets.connect(WS_URL) as ws:
         print("✅ websocket connected", flush=True)
 
-        # Subscribe to SPY trades
-        subscribe_msg = {
-            "action": "subscribe",
-            "params": {
-                "channels": ["trades"],
-                "symbols": [SYMBOL]
-            }
-        }
+        # Step 1: Authenticate with API key
+        auth_msg = {"action": "auth", "params": MASSIVE_API_KEY}
+        await ws.send(json.dumps(auth_msg))
+        print("✅ Authentication message sent", flush=True)
         
+        # Wait for auth confirmation
+        auth_response = await ws.recv()
+        print(f"✅ Auth response: {auth_response}", flush=True)
+
+        # Step 2: Subscribe to SPY trades
+        subscribe_msg = {"action": "subscribe", "params": f"T.{SYMBOL}"}
         await ws.send(json.dumps(subscribe_msg))
         print(f"✅ Subscribed to {SYMBOL} trades", flush=True)
 
+        # Process incoming messages
         async for message in ws:
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
                 continue
 
-            # Handle connection status messages
-            if isinstance(data, list):
-                for event in data:
-                    await process_trade(event, prev_high, prev_low, prev_date)
-            else:
-                await process_trade(data, prev_high, prev_low, prev_date)
+            # Handle array of events or single event
+            events = data if isinstance(data, list) else [data]
+            
+            for event in events:
+                # Massive trade format: {"ev":"T","sym":"SPY","p":686.50,"s":100,"t":1234567890000}
+                if event.get("ev") != "T":  # T = Trade
+                    continue
+                
+                last = to_float(event.get("p"))  # price
+                if last is None:
+                    continue
+                
+                size = event.get("s", 0)  # size
+                timestamp = event.get("t", 0)  # timestamp in milliseconds
+                now = time_module.time()
+                
+                # Determine if this is regular trading hours (9:30 AM - 4:00 PM ET)
+                trade_time = datetime.fromtimestamp(timestamp / 1000, tz=ET)
+                is_regular_hours = (
+                    trade_time.weekday() < 5 and  # Monday-Friday
+                    time(9, 30) <= trade_time.time() <= time(16, 0)
+                )
+                
+                # =========================
+                # OPTIONAL: Watch exact levels
+                # =========================
+                if ENABLE_WATCH and WATCH_PRICES:
+                    if now - last_watch_alert_ts >= 1.0:
+                        for wp in WATCH_PRICES:
+                            if abs(last - wp) <= WATCH_TOLERANCE:
+                                last_watch_alert_ts = now
+                                print(
+                                    f"👀 {ts_str()} WATCH HIT: last={last} size={size} "
+                                    f"tolerance=±{WATCH_TOLERANCE} level={wp}",
+                                    flush=True
+                                )
+                                break
 
+                # =========================
+                # PHANTOM PRINT DETECTION
+                # Must be outside BOTH previous range AND current RTH range
+                # =========================
+                outside_prev = (last > prev_high + PHANTOM_THRESHOLD) or (last < prev_low - PHANTOM_THRESHOLD)
+                
+                # Only flag as phantom if we have established an RTH range AND price is outside it too
+                is_phantom = False
+                if outside_prev and rth_high is not None and rth_low is not None:
+                    outside_current = (last > rth_high + PHANTOM_THRESHOLD) or (last < rth_low - PHANTOM_THRESHOLD)
+                    is_phantom = outside_current
 
-async def process_trade(event, prev_high, prev_low, prev_date):
-    """Process individual trade events"""
-    global rth_high, rth_low, last_phantom_alert_ts, last_rth_alert_ts, last_watch_alert_ts
-    
-    # Massive trade format: {"ev":"T","sym":"SPY","p":686.50,"s":100,"t":1234567890000}
-    if event.get("ev") != "T":  # T = Trade
-        return
-    
-    last = to_float(event.get("p"))  # price
-    if last is None:
-        return
-    
-    size = event.get("s", 0)  # size
-    timestamp = event.get("t", 0)  # timestamp in milliseconds
-    now = time.time()
-    
-    # Determine if this is regular trading hours (9:30 AM - 4:00 PM ET)
-    trade_time = datetime.fromtimestamp(timestamp / 1000, tz=ET)
-    is_regular_hours = (
-        trade_time.weekday() < 5 and  # Monday-Friday
-        time(9, 30) <= trade_time.time() <= time(16, 0)
-    )
-    
-    # =========================
-    # OPTIONAL: Watch exact levels
-    # =========================
-    if ENABLE_WATCH and WATCH_PRICES:
-        if now - last_watch_alert_ts >= 1.0:
-            for wp in WATCH_PRICES:
-                if abs(last - wp) <= WATCH_TOLERANCE:
-                    last_watch_alert_ts = now
+                if is_phantom and (now - last_phantom_alert_ts >= PHANTOM_COOLDOWN_SEC):
+                    last_phantom_alert_ts = now
                     print(
-                        f"👀 {ts_str()} WATCH HIT: last={last} size={size} "
-                        f"tolerance=±{WATCH_TOLERANCE} level={wp}",
+                        f"🚨🚨 {ts_str()} PHANTOM PRINT DETECTED: ${last} size={size} "
+                        f"prev_range=[{prev_low}, {prev_high}] rth_range=[{rth_low}, {rth_high}]",
                         flush=True
                     )
-                    break
 
-    # =========================
-    # PHANTOM PRINT DETECTION
-    # Must be outside BOTH previous range AND current RTH range
-    # =========================
-    outside_prev = (last > prev_high + PHANTOM_THRESHOLD) or (last < prev_low - PHANTOM_THRESHOLD)
-    
-    # Only flag as phantom if we have established an RTH range AND price is outside it too
-    is_phantom = False
-    if outside_prev and rth_high is not None and rth_low is not None:
-        outside_current = (last > rth_high + PHANTOM_THRESHOLD) or (last < rth_low - PHANTOM_THRESHOLD)
-        is_phantom = outside_current
+                # =========================
+                # CURRENT RTH range tracking (regular session only)
+                # =========================
+                if is_regular_hours:
+                    # Check for legitimate RTH range breakout
+                    if rth_high is not None and rth_low is not None:
+                        outside_curr = (last > rth_high + CURRENT_RANGE_BUFFER) or (last < rth_low - CURRENT_RANGE_BUFFER)
 
-    if is_phantom and (now - last_phantom_alert_ts >= PHANTOM_COOLDOWN_SEC):
-        last_phantom_alert_ts = now
-        print(
-            f"🚨🚨 {ts_str()} PHANTOM PRINT DETECTED: ${last} size={size} "
-            f"prev_range=[{prev_low}, {prev_high}] rth_range=[{rth_low}, {rth_high}]",
-            flush=True
-        )
+                        # Only alert if it's NOT a phantom (already alerted above)
+                        if outside_curr and not is_phantom and (now - last_rth_alert_ts >= RTH_COOLDOWN_SEC):
+                            last_rth_alert_ts = now
+                            print(
+                                f"🚨 {ts_str()} CURRENT RTH RANGE BREAK: ${last} size={size} "
+                                f"rth_range=[{rth_low}, {rth_high}]",
+                                flush=True
+                            )
 
-    # =========================
-    # CURRENT RTH range tracking (regular session only)
-    # =========================
-    if is_regular_hours:
-        # Check for legitimate RTH range breakout
-        if rth_high is not None and rth_low is not None:
-            outside_curr = (last > rth_high + CURRENT_RANGE_BUFFER) or (last < rth_low - CURRENT_RANGE_BUFFER)
-
-            # Only alert if it's NOT a phantom (already alerted above)
-            if outside_curr and not is_phantom and (now - last_rth_alert_ts >= RTH_COOLDOWN_SEC):
-                last_rth_alert_ts = now
-                print(
-                    f"🚨 {ts_str()} CURRENT RTH RANGE BREAK: ${last} size={size} "
-                    f"rth_range=[{rth_low}, {rth_high}]",
-                    flush=True
-                )
-
-        # Update RTH range normally
-        rth_low = last if rth_low is None else min(rth_low, last)
-        rth_high = last if rth_high is None else max(rth_high, last)
-
-
-# Initialize globals
-rth_high = None
-rth_low = None
-last_phantom_alert_ts = 0.0
-last_rth_alert_ts = 0.0
-last_watch_alert_ts = 0.0
+                    # Update RTH range normally
+                    rth_low = last if rth_low is None else min(rth_low, last)
+                    rth_high = last if rth_high is None else max(rth_high, last)
 
 
 if __name__ == "__main__":
