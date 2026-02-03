@@ -218,18 +218,34 @@ async def run():
     print("🚀 Starting main loop...", flush=True)
     db = await init_postgres()
 
-    # Try Tradier first (free tier)
-    prev_low, prev_high = fetch_prev_day_range_tradier(SYMBOL, TRADIER_API_KEY)
+    # Check for manual override first
+    manual_low = os.environ.get("MANUAL_PREV_LOW")
+    manual_high = os.environ.get("MANUAL_PREV_HIGH")
     
-    # Fallback to Massive if Tradier fails
-    if prev_low is None or prev_high is None:
-        print("⚠️ Tradier failed, trying Massive as backup...", flush=True)
-        prev_low, prev_high = fetch_prev_day_range_massive(SYMBOL, MASSIVE_API_KEY)
+    if manual_low and manual_high:
+        try:
+            prev_low = float(manual_low)
+            prev_high = float(manual_high)
+            print(f"🔧 Using MANUAL override: low={prev_low} high={prev_high}", flush=True)
+            print("⚠️ Remember to remove MANUAL_PREV_LOW and MANUAL_PREV_HIGH when fixed!", flush=True)
+        except ValueError:
+            print("⚠️ Invalid manual override values, falling back to API...", flush=True)
+            manual_low = None
+            manual_high = None
     
-    # Crash if BOTH sources fail - don't run with bad data
-    if prev_low is None or prev_high is None:
-        print("❌ FATAL: Cannot fetch previous day range from any source!", flush=True)
-        raise RuntimeError("Previous day range required - both Tradier and Massive failed")
+    if not (manual_low and manual_high):
+        # Try Tradier first (free tier)
+        prev_low, prev_high = fetch_prev_day_range_tradier(SYMBOL, TRADIER_API_KEY)
+        
+        # Fallback to Massive if Tradier fails
+        if prev_low is None or prev_high is None:
+            print("⚠️ Tradier failed, trying Massive as backup...", flush=True)
+            prev_low, prev_high = fetch_prev_day_range_massive(SYMBOL, MASSIVE_API_KEY)
+        
+        # Crash if BOTH sources fail - don't run with bad data
+        if prev_low is None or prev_high is None:
+            print("❌ FATAL: Cannot fetch previous day range from any source!", flush=True)
+            raise RuntimeError("Previous day range required - both Tradier and Massive failed")
     
     print(f"📌 Using previous day range: low={prev_low} high={prev_high}", flush=True)
 
