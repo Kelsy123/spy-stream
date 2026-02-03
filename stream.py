@@ -344,10 +344,10 @@ async def run():
                         price < prev_low - PHANTOM_OUTSIDE_PREV
                     )
                     
-                    # Use RTH range for comparison (more accurate than full day range)
-                    # Fall back to today's range if RTH hasn't started yet
-                    compare_low = rth_low if rth_low is not None else today_low
-                    compare_high = rth_high if rth_high is not None else today_high
+                    # Use FULL day range for comparison (premarket + RTH + afterhours)
+                    # This matches the approach of using full extended hours for previous day
+                    compare_low = today_low
+                    compare_high = today_high
                     
                     current_range = (
                         compare_high - compare_low 
