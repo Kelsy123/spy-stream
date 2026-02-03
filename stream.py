@@ -259,20 +259,43 @@ async def run():
     last_rth_alert = 0
 
     while True:
-        ws = await connect_with_backoff()
-        await ws.send(json.dumps({"action": "auth", "params": MASSIVE_API_KEY}))
-        print("🔑 Sent auth...", flush=True)
-        auth_resp = await ws.recv()
-        print(f"🔑 Auth response: {auth_resp}", flush=True)
-        
-        await ws.send(json.dumps({"action": "subscribe", "params": f"T.{SYMBOL}"}))
-        print(f"📡 Subscribed to {SYMBOL}", flush=True)
-        
         try:
+            ws = await connect_with_backoff()
+            print("✅ WebSocket connected", flush=True)
+            
+            # Authenticate
+            auth_msg = {"action": "auth", "params": MASSIVE_API_KEY}
+            await ws.send(json.dumps(auth_msg))
+            print("🔑 Sent auth...", flush=True)
+            
+            # Wait for auth response
+            auth_resp = await ws.recv()
+            print(f"🔑 Auth response: {auth_resp}", flush=True)
+            
+            # Check if auth was successful
+            try:
+                auth_data = json.loads(auth_resp)
+                if isinstance(auth_data, list):
+                    auth_data = auth_data[0] if len(auth_data) > 0 else {}
+                
+                if auth_data.get("status") != "connected":
+                    print(f"❌ Authentication failed: {auth_resp}", flush=True)
+                    await asyncio.sleep(5)
+                    continue
+            except:
+                pass
+            
+            # Subscribe to trades
+            sub_msg = {"action": "subscribe", "params": f"T.{SYMBOL}"}
+            await ws.send(json.dumps(sub_msg))
+            print(f"📡 Subscribed to {SYMBOL}", flush=True)
+            
+            # Main message loop
             async for raw in ws:
                 try:
                     msg = json.loads(raw)
-                except:
+                except Exception as e:
+                    print(f"⚠️ JSON parse error: {e}", flush=True)
                     continue
                     
                 events = msg if isinstance(msg, list) else [msg]
@@ -439,10 +462,16 @@ async def run():
                                     flush=True
                                 )
                                 
-        except Exception as e:
+        except websockets.exceptions.ConnectionClosed as e:
             print(f"⚠️ Websocket closed: {e}", flush=True)
-            print("🔁 Reconnecting…", flush=True)
-            await asyncio.sleep(2)
+            print("🔁 Reconnecting in 5 seconds...", flush=True)
+            await asyncio.sleep(5)
+        except Exception as e:
+            print(f"⚠️ Unexpected error: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            print("🔁 Reconnecting in 5 seconds...", flush=True)
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     try:
