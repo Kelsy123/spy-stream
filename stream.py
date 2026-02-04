@@ -41,7 +41,7 @@ IGNORE_CONDITIONS = {
     0, 14, 4, 9, 19, 53, 1
 }
 PHANTOM_RELEVANT_CONDITIONS = {
-    2, 3, 7, 8, 10, 13, 15, 16, 17, 20, 21, 22, 25, 26, 28, 29, 30, 33, 34, 37, 62
+    2, 3, 7, 8, 10, 12, 13, 15, 16, 17, 20, 21, 22, 25, 26, 28, 29, 30, 33, 34, 37, 62
 }
 
 # ======================================================
@@ -309,7 +309,12 @@ async def run():
                         continue
                         
                     size = e.get("s", 0)
+                    
                     conds = e.get("c", [])
+                        for c in conds:
+                            if c not in PHANTOM_RELEVANT_CONDITIONS and c not in IGNORE_CONDITIONS:
+                                print(f"⚠️ Unknown condition code {c} in trade: {e}", flush=True)
+                                
                     exch = e.get("x")
                     sip_ts_raw = e.get("t")
                     trf_ts_raw = e.get("trft")
