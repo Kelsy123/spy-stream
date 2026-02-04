@@ -21,8 +21,8 @@ DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 TRADIER_API_KEY = os.environ["TRADIER_API_KEY"]
 
 # Phantom thresholds
-PHANTOM_OUTSIDE_PREV = 1.00
-PHANTOM_OUTSIDE_RTH_MULT = 0.50
+PHANTOM_OUTSIDE_PREV = 0.10
+PHANTOM_OUTSIDE_RTH_MULT = 0.25
 
 # Cooldowns
 PHANTOM_COOLDOWN = 5
@@ -38,10 +38,10 @@ LOG_ALL_TRADES = False
 # SIP CONDITION FILTERING
 # ======================================================
 IGNORE_CONDITIONS = {
-    0, 37, 14, 41, 4, 9, 19, 53, 12, 1
+    0, 14, 41, 4, 9, 19, 53, 1
 }
 PHANTOM_RELEVANT_CONDITIONS = {
-    2, 3, 7, 8, 16, 17, 20, 21, 22, 62
+    2, 3, 7, 8, 10, 13, 15, 16, 17, 20, 21, 22, 25, 26, 28, 29, 30, 33, 34, 62
 }
 
 # ======================================================
