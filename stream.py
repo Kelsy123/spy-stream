@@ -309,12 +309,10 @@ async def run():
                         continue
                         
                     size = e.get("s", 0)
-                    
                     conds = e.get("c", [])
-                        for c in conds:
-                            if c not in PHANTOM_RELEVANT_CONDITIONS and c not in IGNORE_CONDITIONS:
-                                print(f"⚠️ Unknown condition code {c} in trade: {e}", flush=True)
-                                
+                    for c in conds:
+                        if c not in PHANTOM_RELEVANT_CONDITIONS and c not in IGNORE_CONDITIONS:
+                            print(f"⚠️ Unknown condition code {c} in trade: {e}", flush=True)
                     exch = e.get("x")
                     sip_ts_raw = e.get("t")
                     trf_ts_raw = e.get("trft")
