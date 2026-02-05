@@ -69,7 +69,7 @@ LOG_ALL_TRADES = False
 # SIP CONDITION FILTERING
 # ======================================================
 IGNORE_CONDITIONS = {
-    0, 14, 4, 9, 19, 53, 1
+    0, 14, 4, 9, 19, 52, 53, 1
 }
 PHANTOM_RELEVANT_CONDITIONS = {
     2, 3, 7, 8, 10, 12, 13, 15, 16, 17, 20, 21, 22, 25, 26, 28, 29, 30, 33, 34, 37, 41, 62
@@ -107,6 +107,7 @@ class VelocityWindow:
         self.end_time = start_time + VELOCITY_WINDOW_SEC
         self.trade_count = 0
         self.total_volume = 0
+        self.notional_volume = 0  # Track dollar volume (price × size)
         self.highest_price = None
         self.lowest_price = None
         self.made_new_high = False
@@ -116,6 +117,7 @@ class VelocityWindow:
         """Add a trade to this window"""
         self.trade_count += 1
         self.total_volume += size
+        self.notional_volume += price * size  # Track notional value
         
         # Track window high/low
         if self.highest_price is None or price > self.highest_price:
@@ -139,8 +141,10 @@ class VelocityWindow:
         return {
             'trade_velocity': self.trade_count / duration if duration > 0 else 0,
             'volume_velocity': self.total_volume / duration if duration > 0 else 0,
+            'notional_velocity': self.notional_volume / duration if duration > 0 else 0,
             'trade_count': self.trade_count,
             'total_volume': self.total_volume,
+            'notional_volume': self.notional_volume,
             'made_new_high': self.made_new_high,
             'made_new_low': self.made_new_low,
             'highest_price': self.highest_price,
@@ -150,6 +154,11 @@ class VelocityWindow:
 def detect_velocity_divergence(windows, session_high, session_low):
     """
     Detect velocity divergence - price makes new high/low but velocity drops
+    
+    Uses TRIPLE CONFIRMATION:
+    - Trade velocity drops (fewer trades)
+    - Volume velocity drops (fewer shares)
+    - Notional velocity drops (fewer dollars)
     
     Returns: (is_divergence, alert_data) tuple
     """
@@ -173,25 +182,29 @@ def detect_velocity_divergence(windows, session_high, session_low):
     # Calculate average velocity of previous windows
     prev_trade_velocities = [w.get_metrics()['trade_velocity'] for w in previous_windows]
     prev_volume_velocities = [w.get_metrics()['volume_velocity'] for w in previous_windows]
+    prev_notional_velocities = [w.get_metrics()['notional_velocity'] for w in previous_windows]
     
     if not prev_trade_velocities:
         return False, None
     
     avg_prev_trade_vel = sum(prev_trade_velocities) / len(prev_trade_velocities)
     avg_prev_volume_vel = sum(prev_volume_velocities) / len(prev_volume_velocities)
+    avg_prev_notional_vel = sum(prev_notional_velocities) / len(prev_notional_velocities)
     
     # Avoid division by zero
-    if avg_prev_trade_vel == 0 or avg_prev_volume_vel == 0:
+    if avg_prev_trade_vel == 0 or avg_prev_volume_vel == 0 or avg_prev_notional_vel == 0:
         return False, None
     
-    # Check for velocity drop
+    # Check for velocity drops (ALL THREE must drop)
     trade_vel_drop_pct = 1 - (current_metrics['trade_velocity'] / avg_prev_trade_vel)
     volume_vel_drop_pct = 1 - (current_metrics['volume_velocity'] / avg_prev_volume_vel)
+    notional_vel_drop_pct = 1 - (current_metrics['notional_velocity'] / avg_prev_notional_vel)
     
-    # Divergence detected if BOTH velocities dropped by threshold
+    # TRIPLE CONFIRMATION: All three velocities must drop by threshold
     is_divergence = (
         trade_vel_drop_pct >= VELOCITY_DROP_THRESHOLD and
-        volume_vel_drop_pct >= VELOCITY_DROP_THRESHOLD
+        volume_vel_drop_pct >= VELOCITY_DROP_THRESHOLD and
+        notional_vel_drop_pct >= VELOCITY_DROP_THRESHOLD
     )
     
     if is_divergence:
@@ -200,9 +213,12 @@ def detect_velocity_divergence(windows, session_high, session_low):
             'price': current_metrics['highest_price'] if current_metrics['made_new_high'] else current_metrics['lowest_price'],
             'trade_vel_drop_pct': trade_vel_drop_pct * 100,
             'volume_vel_drop_pct': volume_vel_drop_pct * 100,
+            'notional_vel_drop_pct': notional_vel_drop_pct * 100,
             'current_trade_count': current_metrics['trade_count'],
             'current_volume': current_metrics['total_volume'],
+            'current_notional': current_metrics['notional_volume'],
             'prev_avg_trades': avg_prev_trade_vel * VELOCITY_WINDOW_SEC,
+            'prev_avg_notional': avg_prev_notional_vel * VELOCITY_WINDOW_SEC,
             'session_high': session_high,
             'session_low': session_low
         }
@@ -531,8 +547,9 @@ async def run():
                                             print(
                                                 f"⚡ VELOCITY DIVERGENCE {ts_str()} "
                                                 f"{alert_data['direction']} @ ${alert_data['price']:.2f} "
-                                                f"trade_vel_drop={alert_data['trade_vel_drop_pct']:.1f}% "
-                                                f"volume_vel_drop={alert_data['volume_vel_drop_pct']:.1f}%",
+                                                f"trade_drop={alert_data['trade_vel_drop_pct']:.1f}% "
+                                                f"volume_drop={alert_data['volume_vel_drop_pct']:.1f}% "
+                                                f"notional_drop={alert_data['notional_vel_drop_pct']:.1f}%",
                                                 flush=True
                                             )
                                             
@@ -540,11 +557,16 @@ async def run():
                                             vel_msg = (
                                                 f"⚡ **Velocity Divergence Detected**\n"
                                                 f"Direction: **{alert_data['direction']}** at **${alert_data['price']:.2f}**\n"
-                                                f"Trade Velocity Drop: **{alert_data['trade_vel_drop_pct']:.1f}%**\n"
-                                                f"Volume Velocity Drop: **{alert_data['volume_vel_drop_pct']:.1f}%**\n"
+                                                f"📉 **Triple Confirmation:**\n"
+                                                f"  • Trade Velocity Drop: **{alert_data['trade_vel_drop_pct']:.1f}%**\n"
+                                                f"  • Volume Velocity Drop: **{alert_data['volume_vel_drop_pct']:.1f}%**\n"
+                                                f"  • Notional Velocity Drop: **{alert_data['notional_vel_drop_pct']:.1f}%**\n"
+                                                f"\n"
                                                 f"Current Window: {alert_data['current_trade_count']} trades, "
-                                                f"{alert_data['current_volume']:,} shares\n"
-                                                f"Previous Avg: {alert_data['prev_avg_trades']:.0f} trades per window\n"
+                                                f"{alert_data['current_volume']:,} shares, "
+                                                f"${alert_data['current_notional']:,.0f} notional\n"
+                                                f"Previous Avg: {alert_data['prev_avg_trades']:.0f} trades, "
+                                                f"${alert_data['prev_avg_notional']:,.0f} notional per window\n"
                                                 f"Session Range: [{alert_data['session_low']:.2f}, {alert_data['session_high']:.2f}]\n"
                                                 f"Time: {ts_str()}"
                                             )
