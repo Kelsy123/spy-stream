@@ -22,7 +22,7 @@ TRADIER_API_KEY = os.environ["TRADIER_API_KEY"]
 
 # Phantom thresholds
 PHANTOM_OUTSIDE_PREV = 0.10
-PHANTOM_OUTSIDE_RTH_MULT = 0.25
+PHANTOM_GAP_FROM_CURRENT = 0.25  # Fixed 25 cent gap from current day's range
 
 # Cooldowns
 PHANTOM_COOLDOWN = 5
@@ -199,272 +199,238 @@ async def init_postgres():
     return conn
 
 # ======================================================
-# WEBSOCKET WITH BACKOFF
-# ======================================================
-async def connect_with_backoff():
-    delay = 2
-    while True:
-        try:
-            return await websockets.connect(WS_URL)
-        except Exception as e:
-            print(f"⚠️ Websocket connect failed ({e}), retrying in {delay}s", flush=True)
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 60)
-
-# ======================================================
-# MAIN LOOP
+# MAIN
 # ======================================================
 async def run():
-    print("🚀 Starting main loop...", flush=True)
+    # Fetch previous day range
+    prev_low, prev_high = fetch_prev_day_range_tradier(SYMBOL, TRADIER_API_KEY)
+    
+    if prev_low is None or prev_high is None:
+        prev_low, prev_high = fetch_prev_day_range_massive(SYMBOL, MASSIVE_API_KEY)
+    
+    if prev_low is None or prev_high is None:
+        print("❌ FATAL: Could not fetch previous day range from any source", flush=True)
+        return
+    
+    print(f"📊 Using previous day range: low={prev_low}, high={prev_high}", flush=True)
+    
+    # Connect to Postgres
     db = await init_postgres()
-
-    # Check for manual override first
-    manual_low = os.environ.get("MANUAL_PREV_LOW")
-    manual_high = os.environ.get("MANUAL_PREV_HIGH")
     
-    if manual_low and manual_high:
-        try:
-            prev_low = float(manual_low)
-            prev_high = float(manual_high)
-            print(f"🔧 Using MANUAL override: low={prev_low} high={prev_high}", flush=True)
-            print("⚠️ Remember to remove MANUAL_PREV_LOW and MANUAL_PREV_HIGH when fixed!", flush=True)
-        except ValueError:
-            print("⚠️ Invalid manual override values, falling back to API...", flush=True)
-            manual_low = None
-            manual_high = None
+    # Session ranges
+    today_low = None
+    today_high = None
+    premarket_low = None
+    premarket_high = None
+    rth_low = None
+    rth_high = None
+    afterhours_low = None
+    afterhours_high = None
     
-    if not (manual_low and manual_high):
-        # Try Tradier first (free tier)
-        prev_low, prev_high = fetch_prev_day_range_tradier(SYMBOL, TRADIER_API_KEY)
-        
-        # Fallback to Massive if Tradier fails
-        if prev_low is None or prev_high is None:
-            print("⚠️ Tradier failed, trying Massive as backup...", flush=True)
-            prev_low, prev_high = fetch_prev_day_range_massive(SYMBOL, MASSIVE_API_KEY)
-        
-        # Crash if BOTH sources fail - don't run with bad data
-        if prev_low is None or prev_high is None:
-            print("❌ FATAL: Cannot fetch previous day range from any source!", flush=True)
-            raise RuntimeError("Previous day range required - both Tradier and Massive failed")
-    
-    print(f"📌 Using previous day range: low={prev_low} high={prev_high}", flush=True)
-
-    # Initialize today's session ranges
-    today_low, today_high = None, None
-    premarket_low, premarket_high = None, None
-    rth_low, rth_high = None, None
-    afterhours_low, afterhours_high = None, None
-
+    # Cooldown tracking
     last_phantom_alert = 0
     last_rth_alert = 0
-
+    
+    # Tracking for initial range establishment
+    initial_trades_count = 0
+    INITIAL_TRADES_THRESHOLD = 100  # Wait for 100 trades before enabling phantom detection
+    
     while True:
         try:
-            ws = await connect_with_backoff()
-            print("✅ WebSocket connected", flush=True)
-            
-            # Authenticate
-            auth_msg = {"action": "auth", "params": MASSIVE_API_KEY}
-            await ws.send(json.dumps(auth_msg))
-            print("🔑 Sent auth...", flush=True)
-            
-            # Wait for auth response
-            auth_resp = await ws.recv()
-            print(f"🔑 Auth response: {auth_resp}", flush=True)
-            
-            # Check if auth was successful
-            try:
-                auth_data = json.loads(auth_resp)
-                if isinstance(auth_data, list):
-                    auth_data = auth_data[0] if len(auth_data) > 0 else {}
+            async with websockets.connect(WS_URL) as ws:
+                # Authenticate
+                auth_msg = {"action": "auth", "params": MASSIVE_API_KEY}
+                await ws.send(json.dumps(auth_msg))
+                print("🔐 Authenticated.", flush=True)
                 
-                if auth_data.get("status") != "connected":
-                    print(f"❌ Authentication failed: {auth_resp}", flush=True)
-                    await asyncio.sleep(5)
-                    continue
-            except:
-                pass
-            
-            # Subscribe to trades
-            sub_msg = {"action": "subscribe", "params": f"T.{SYMBOL}"}
-            await ws.send(json.dumps(sub_msg))
-            print(f"📡 Subscribed to {SYMBOL}", flush=True)
-            
-            # Main message loop
-            async for raw in ws:
-                try:
-                    msg = json.loads(raw)
-                except Exception as e:
-                    print(f"⚠️ JSON parse error: {e}", flush=True)
-                    continue
-                    
-                events = msg if isinstance(msg, list) else [msg]
+                # Subscribe to trades
+                sub_msg = {"action": "subscribe", "params": f"T.{SYMBOL}"}
+                await ws.send(json.dumps(sub_msg))
+                print(f"📡 Subscribed to {SYMBOL}", flush=True)
                 
-                for e in events:
-                    if e.get("ev") != "T":
+                # Main message loop
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except Exception as e:
+                        print(f"⚠️ JSON parse error: {e}", flush=True)
                         continue
                         
-                    price = to_float(e.get("p"))
-                    if price is None:
-                        continue
-                        
-                    size = e.get("s", 0)
-                    conds = e.get("c", [])
-                    for c in conds:
-                        if c not in PHANTOM_RELEVANT_CONDITIONS and c not in IGNORE_CONDITIONS:
-                            print(f"⚠️ Unknown condition code {c} in trade: {e}", flush=True)
-                    exch = e.get("x")
-                    sip_ts_raw = e.get("t")
-                    trf_ts_raw = e.get("trft")
-                    sequence = e.get("q")
-                    trf_id = e.get("trfi")
-
-                    if LOG_ALL_TRADES:
-                        print(f"TRADE {price} size={size} cond={conds} exch={exch}")
-
-                    tm = datetime.fromtimestamp(sip_ts_raw/1000, tz=ET).time()
-
-                    # Update today's full session range
-                    if today_low is None or price < today_low:
-                        today_low = price
-                    if today_high is None or price > today_high:
-                        today_high = price
-
-                    # Update session-specific ranges
-                    in_premarket = time(4, 0) <= tm < time(9, 30)
-                    in_rth = time(9, 30) <= tm < time(16, 0)
-                    in_afterhours = time(16, 0) <= tm <= time(20, 0)
+                    events = msg if isinstance(msg, list) else [msg]
                     
-                    if in_premarket:
-                        if premarket_low is None or price < premarket_low:
-                            premarket_low = price
-                        if premarket_high is None or price > premarket_high:
-                            premarket_high = price
+                    for e in events:
+                        if e.get("ev") != "T":
+                            continue
                             
-                    elif in_rth:
-                        if rth_low is None or price < rth_low:
-                            rth_low = price
-                        if rth_high is None or price > rth_high:
-                            rth_high = price
+                        price = to_float(e.get("p"))
+                        if price is None:
+                            continue
                             
-                    elif in_afterhours:
-                        if afterhours_low is None or price < afterhours_low:
-                            afterhours_low = price
-                        if afterhours_high is None or price > afterhours_high:
-                            afterhours_high = price
+                        size = e.get("s", 0)
+                        conds = e.get("c", [])
+                        for c in conds:
+                            if c not in PHANTOM_RELEVANT_CONDITIONS and c not in IGNORE_CONDITIONS:
+                                print(f"⚠️ Unknown condition code {c} in trade: {e}", flush=True)
+                        exch = e.get("x")
+                        sip_ts_raw = e.get("t")
+                        trf_ts_raw = e.get("trft")
+                        sequence = e.get("q")
+                        trf_id = e.get("trfi")
 
-                    # Filter out bad conditions
-                    bad_conditions = any(c in IGNORE_CONDITIONS for c in conds)
-                    
-                    # Don't require dark pool - phantoms can appear on lit exchanges too
-                    # is_darkpool = (exch == 4)  # REMOVED THIS REQUIREMENT
-                    
-                    phantom_cond_ok = (
-                        any(c in PHANTOM_RELEVANT_CONDITIONS for c in conds)
-                        and not bad_conditions
-                    )
-                    
-                    # Check if outside previous day's range
-                    outside_prev = (
-                        price > prev_high + PHANTOM_OUTSIDE_PREV or
-                        price < prev_low - PHANTOM_OUTSIDE_PREV
-                    )
-                    
-                    # Use FULL day range for comparison (premarket + RTH + afterhours)
-                    # This matches the approach of using full extended hours for previous day
-                    compare_low = today_low
-                    compare_high = today_high
-                    
-                    current_range = (
-                        compare_high - compare_low 
-                        if compare_low is not None and compare_high is not None 
-                        else 0
-                    )
-                    
-                    phantom_gap = max(PHANTOM_OUTSIDE_PREV, current_range * PHANTOM_OUTSIDE_RTH_MULT)
-                    
-                    outside_current_far = False
-                    if compare_high is not None and compare_low is not None:
-                        outside_current_far = (
-                            price > compare_high + phantom_gap or
-                            price < compare_low - phantom_gap
-                        )
-                    
-                    # Phantom detection: must meet ALL criteria
-                    is_phantom = (
-                        phantom_cond_ok and      # Has valid conditions
-                        outside_prev and         # Outside previous day
-                        outside_current_far      # WAY outside current range
-                    )
-                    
-                    now = time_module.time()
-                    
-                    if is_phantom:
-                        # ALWAYS PRINT TO CONSOLE
-                        distance = min(
-                            abs(price - compare_high) if compare_high else float('inf'),
-                            abs(price - compare_low) if compare_low else float('inf')
-                        )
+                        if LOG_ALL_TRADES:
+                            print(f"TRADE {price} size={size} cond={conds} exch={exch}")
+
+                        tm = datetime.fromtimestamp(sip_ts_raw/1000, tz=ET).time()
+
+                        # Update today's full session range
+                        if today_low is None or price < today_low:
+                            today_low = price
+                        if today_high is None or price > today_high:
+                            today_high = price
+
+                        # Update session-specific ranges
+                        in_premarket = time(4, 0) <= tm < time(9, 30)
+                        in_rth = time(9, 30) <= tm < time(16, 0)
+                        in_afterhours = time(16, 0) <= tm <= time(20, 0)
                         
-                        print(
-                            f"🚨🚨 PHANTOM PRINT {ts_str()} ${price} "
-                            f"size={size} conds={conds} exch={exch} seq={sequence} "
-                            f"distance=${distance:.2f} from current range",
-                            flush=True
-                        )
-                        
-                        # ALWAYS SEND TO DISCORD
-                        msg = (
-                            f"🚨 **Phantom Print Detected**\n"
-                            f"Price: **${price}**\n"
-                            f"Size: {size}\n"
-                            f"Exchange: {exch}\n"
-                            f"Conditions: {conds}\n"
-                            f"Distance from range: ${distance:.2f}\n"
-                            f"Current range: [{compare_low}, {compare_high}]\n"
-                            f"SIP Time: {datetime.fromtimestamp(sip_ts_raw/1000, tz=ET)}\n"
-                            f"TRF Time: {datetime.fromtimestamp(trf_ts_raw/1000, tz=ET) if trf_ts_raw else 'None'}\n"
-                            f"Sequence: {sequence}\n"
-                            f"TRF ID: {trf_id}"
-                        )
-                        asyncio.create_task(send_discord(msg))
-                        
-                        # INSERT INTO POSTGRES
-                        await db.execute("""
-                        INSERT INTO phantoms (
-                            ts, sip_ts, trf_ts, price, size,
-                            conditions, exchange, sequence, trf_id
-                        )
-                        VALUES (
-                            NOW(),
-                            to_timestamp($1 / 1000.0),
-                            to_timestamp($2 / 1000.0),
-                            $3, $4, $5, $6, $7, $8
-                        );
-                        """, sip_ts_raw, trf_ts_raw or sip_ts_raw, price, size,
-                        json.dumps(conds), exch, sequence, trf_id)
-                        
-                        # WINDOW LOGIC
-                        if now - last_phantom_alert > PHANTOM_COOLDOWN:
-                            last_phantom_alert = now
-                            print("🔥🔥 NEW PHANTOM WINDOW OPEN 🔥🔥", flush=True)
-                        else:
-                            print("⏳ (within cooldown window)", flush=True)
-                    
-                    # RTH breakout logic
-                    if in_rth and not bad_conditions:
-                        if rth_high is not None and rth_low is not None:
-                            breakout = price > rth_high + RTH_BREAK_BUFFER or price < rth_low - RTH_BREAK_BUFFER
-                            
-                            if breakout and not is_phantom and now - last_rth_alert > RTH_COOLDOWN:
-                                last_rth_alert = now
-                                print(
-                                    f"🚨 RTH BREAKOUT {ts_str()} ${price} "
-                                    f"size={size} conds={conds} exch={exch} "
-                                    f"rth=[{rth_low},{rth_high}]",
-                                    flush=True
-                                )
+                        if in_premarket:
+                            if premarket_low is None or price < premarket_low:
+                                premarket_low = price
+                            if premarket_high is None or price > premarket_high:
+                                premarket_high = price
                                 
+                        elif in_rth:
+                            if rth_low is None or price < rth_low:
+                                rth_low = price
+                            if rth_high is None or price > rth_high:
+                                rth_high = price
+                                
+                        elif in_afterhours:
+                            if afterhours_low is None or price < afterhours_low:
+                                afterhours_low = price
+                            if afterhours_high is None or price > afterhours_high:
+                                afterhours_high = price
+
+                        # Increment trade counter for initial range establishment
+                        initial_trades_count += 1
+
+                        # Filter out bad conditions
+                        bad_conditions = any(c in IGNORE_CONDITIONS for c in conds)
+                        
+                        phantom_cond_ok = (
+                            any(c in PHANTOM_RELEVANT_CONDITIONS for c in conds)
+                            and not bad_conditions
+                        )
+                        
+                        # ====================================================================
+                        # FIX #1: Check if outside previous day's range (STRICT)
+                        # Only trigger if price is genuinely beyond yesterday's boundaries
+                        # ====================================================================
+                        outside_prev = (
+                            price > prev_high + PHANTOM_OUTSIDE_PREV or
+                            price < prev_low - PHANTOM_OUTSIDE_PREV
+                        )
+                        
+                        # ====================================================================
+                        # FIX #2: Only check phantom prints AFTER initial range established
+                        # This prevents false alerts when the range is still being built
+                        # ====================================================================
+                        if initial_trades_count < INITIAL_TRADES_THRESHOLD:
+                            # Skip phantom detection during initial range building
+                            is_phantom = False
+                        else:
+                            # Use FULL day range for comparison
+                            compare_low = today_low
+                            compare_high = today_high
+                            
+                            # ====================================================================
+                            # FIX #3: Use fixed 25 cent gap from current range
+                            # Simpler and more predictable than multiplier approach
+                            # ====================================================================
+                            outside_current_far = False
+                            if compare_high is not None and compare_low is not None:
+                                outside_current_far = (
+                                    price > compare_high + PHANTOM_GAP_FROM_CURRENT or
+                                    price < compare_low - PHANTOM_GAP_FROM_CURRENT
+                                )
+                            
+                            # Phantom detection: must meet ALL criteria
+                            is_phantom = (
+                                phantom_cond_ok and      # Has valid conditions
+                                outside_prev and         # Outside previous day (strictly)
+                                outside_current_far      # WAY outside current range
+                            )
+                        
+                        now = time_module.time()
+                        
+                        if is_phantom:
+                            # ALWAYS PRINT TO CONSOLE
+                            distance = min(
+                                abs(price - compare_high) if compare_high else float('inf'),
+                                abs(price - compare_low) if compare_low else float('inf')
+                            )
+                            
+                            print(
+                                f"🚨🚨 PHANTOM PRINT {ts_str()} ${price} "
+                                f"size={size} conds={conds} exch={exch} seq={sequence} "
+                                f"distance=${distance:.2f} from current range "
+                                f"prev=[{prev_low},{prev_high}] current=[{compare_low},{compare_high}]",
+                                flush=True
+                            )
+                            
+                            # ALWAYS SEND TO DISCORD
+                            msg = (
+                                f"🚨 **Phantom Print Detected**\n"
+                                f"Price: **${price}**\n"
+                                f"Size: {size}\n"
+                                f"Exchange: {exch}\n"
+                                f"Conditions: {conds}\n"
+                                f"Distance from range: ${distance:.2f}\n"
+                                f"Previous day: [{prev_low}, {prev_high}]\n"
+                                f"Current range: [{compare_low}, {compare_high}]\n"
+                                f"SIP Time: {datetime.fromtimestamp(sip_ts_raw/1000, tz=ET)}\n"
+                                f"TRF Time: {datetime.fromtimestamp(trf_ts_raw/1000, tz=ET) if trf_ts_raw else 'None'}\n"
+                                f"Sequence: {sequence}\n"
+                                f"TRF ID: {trf_id}"
+                            )
+                            asyncio.create_task(send_discord(msg))
+                            
+                            # INSERT INTO POSTGRES
+                            await db.execute("""
+                            INSERT INTO phantoms (
+                                ts, sip_ts, trf_ts, price, size,
+                                conditions, exchange, sequence, trf_id
+                            )
+                            VALUES (
+                                NOW(),
+                                to_timestamp($1 / 1000.0),
+                                to_timestamp($2 / 1000.0),
+                                $3, $4, $5, $6, $7, $8
+                            );
+                            """, sip_ts_raw, trf_ts_raw or sip_ts_raw, price, size,
+                            json.dumps(conds), exch, sequence, trf_id)
+                            
+                            # WINDOW LOGIC
+                            if now - last_phantom_alert > PHANTOM_COOLDOWN:
+                                last_phantom_alert = now
+                                print("🔥🔥 NEW PHANTOM WINDOW OPEN 🔥🔥", flush=True)
+                            else:
+                                print("⏳ (within cooldown window)", flush=True)
+                        
+                        # RTH breakout logic
+                        if in_rth and not bad_conditions:
+                            if rth_high is not None and rth_low is not None:
+                                breakout = price > rth_high + RTH_BREAK_BUFFER or price < rth_low - RTH_BREAK_BUFFER
+                                
+                                if breakout and not is_phantom and now - last_rth_alert > RTH_COOLDOWN:
+                                    last_rth_alert = now
+                                    print(
+                                        f"🚨 RTH BREAKOUT {ts_str()} ${price} "
+                                        f"size={size} conds={conds} exch={exch} "
+                                        f"rth=[{rth_low},{rth_high}]",
+                                        flush=True
+                                    )
+                                    
         except websockets.exceptions.ConnectionClosed as e:
             print(f"⚠️ Websocket closed: {e}", flush=True)
             print("🔁 Reconnecting in 5 seconds...", flush=True)
