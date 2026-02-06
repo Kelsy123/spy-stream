@@ -69,7 +69,7 @@ LOG_ALL_TRADES = False
 # SIP CONDITION FILTERING
 # ======================================================
 IGNORE_CONDITIONS = {
-    0, 14, 4, 9, 19, 53, 1
+    0, 14, 4, 9, 19, 53, 1, 52
 }
 PHANTOM_RELEVANT_CONDITIONS = {
     2, 3, 7, 8, 10, 12, 13, 15, 16, 17, 20, 21, 22, 25, 26, 28, 29, 30, 33, 34, 37, 41, 62
