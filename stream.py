@@ -356,6 +356,16 @@ JSON: {self.json_file}
                 for price, count in sorted(repeated.items(), key=lambda x: x[1], reverse=True)[:3]:
                     discord_msg += f"  ${price:.2f}: {count}x\n"
             
+            # List individual trades
+            discord_msg += f"\nIndividual Trades:\n"
+            discord_msg += f"{'#':<4} {'Time':<12} {'Price':<10} {'Exchange':<15}\n"
+            discord_msg += f"{'-'*45}\n"
+            
+            for i, trade in enumerate(self.zero_trades, 1):
+                # Truncate exchange name if too long
+                exch_name = trade['exchange_name'][:14]
+                discord_msg += f"{i:<4} {trade['time_est']:<12} ${trade['price']:<9.2f} {exch_name:<15}\n"
+            
             discord_msg += "```"
             await send_discord(discord_msg)
         
@@ -554,7 +564,7 @@ TOP PRINTS BY NOTIONAL VALUE
         total_notional = sum(p['notional'] for p in sorted_prints)
         
         # Build Discord message
-        msg = f"🟣 **Large Dark Pool Prints Summary - {self.ticker}**\n"
+        msg = f"🟣 **Large Dark Pool Prints (≥100k) Summary - {self.ticker}**\n"
         msg += f"**{self.today}**\n\n"
         msg += f"**Statistics:**\n"
         msg += f"• Total Prints: **{total_prints}**\n"
@@ -601,6 +611,185 @@ TOP PRINTS BY NOTIONAL VALUE
         """Save daily summary to file and send to Discord"""
         summary = self.get_daily_summary()
         summary_file = self.log_dir / f"summary_dark_pool_{self.ticker}_{self.today}.txt"
+        with open(summary_file, 'w') as f:
+            f.write(summary)
+        print(summary, flush=True)
+        
+        # Send to Discord
+        discord_msg = self.get_discord_summary()
+        if discord_msg:
+            await send_discord(discord_msg)
+        
+        return summary_file
+
+# ======================================================
+# PHANTOM PRINT TRACKER
+# ======================================================
+class PhantomPrintTracker:
+    """
+    Tracks phantom prints throughout the day
+    Generates end-of-day summary with all prints listed chronologically
+    """
+    def __init__(self, ticker="SPY"):
+        self.ticker = ticker
+        
+        # Use /tmp for Railway ephemeral storage
+        self.log_dir = Path("/tmp/phantom_logs")
+        self.log_dir.mkdir(exist_ok=True)
+        
+        # Create daily log file
+        self.today = datetime.now(ET).strftime('%Y-%m-%d')
+        self.csv_file = self.log_dir / f"phantoms_{self.ticker}_{self.today}.csv"
+        
+        # In-memory storage for session
+        self.phantom_prints = []
+        
+        # Initialize CSV with headers
+        self.init_csv()
+        
+        print(f"👻 Phantom print tracker initialized.", flush=True)
+        
+    def init_csv(self):
+        """Create CSV file with headers if it doesn't exist"""
+        if not self.csv_file.exists():
+            with open(self.csv_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'Timestamp_MS',
+                    'Time_EST',
+                    'Price',
+                    'Size',
+                    'Exchange',
+                    'Conditions',
+                    'Sequence',
+                    'SIP_Timestamp',
+                    'TRF_Timestamp',
+                    'TRF_ID',
+                    'Distance_From_Range'
+                ])
+    
+    def log_phantom_print(self, trade_data, distance_from_range):
+        """
+        Log a phantom print
+        
+        Args:
+            trade_data: Dictionary with Massive.com trade fields
+            distance_from_range: Distance from current trading range
+        """
+        timestamp_ms = trade_data.get('sip_timestamp', 0)
+        timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=ET)
+        
+        price = trade_data.get('price')
+        size = trade_data.get('size')
+        
+        phantom_record = {
+            'timestamp_ms': timestamp_ms,
+            'timestamp': timestamp_dt.isoformat(),
+            'time_est': timestamp_dt.strftime('%H:%M:%S.%f')[:-3],
+            'price': price,
+            'size': size,
+            'exchange': trade_data.get('exchange'),
+            'conditions': trade_data.get('conditions', []),
+            'sequence': trade_data.get('sequence'),
+            'sip_timestamp': trade_data.get('sip_timestamp'),
+            'trf_timestamp': trade_data.get('trf_timestamp'),
+            'trf_id': trade_data.get('trf_id'),
+            'distance': distance_from_range
+        }
+        
+        # Add to in-memory list
+        self.phantom_prints.append(phantom_record)
+        
+        # Write to CSV
+        self.write_to_csv(phantom_record)
+        
+        return phantom_record
+    
+    def write_to_csv(self, record):
+        """Append record to CSV file"""
+        with open(self.csv_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                record['timestamp_ms'],
+                record['time_est'],
+                record['price'],
+                record['size'],
+                record['exchange'],
+                '|'.join(str(c) for c in record['conditions']),
+                record['sequence'],
+                record['sip_timestamp'],
+                record['trf_timestamp'],
+                record['trf_id'],
+                record['distance']
+            ])
+    
+    def get_daily_summary(self):
+        """
+        Generate end-of-day summary with all prints in chronological order
+        """
+        if not self.phantom_prints:
+            return "No phantom prints recorded today"
+        
+        summary = f"""
+{'='*100}
+PHANTOM PRINTS SUMMARY - {self.ticker} - {self.today}
+{'='*100}
+
+STATISTICS:
+  Total Phantom Prints: {len(self.phantom_prints)}
+  Price Range: ${min(p['price'] for p in self.phantom_prints):.2f} - ${max(p['price'] for p in self.phantom_prints):.2f}
+  First: {self.phantom_prints[0]['time_est']}
+  Last:  {self.phantom_prints[-1]['time_est']}
+
+{'='*100}
+ALL PHANTOM PRINTS (Chronological Order)
+{'='*100}
+{'#':<5} {'Time':<12} {'Price':<10} {'Size':<12} {'Distance':<12} {'Exchange':<10} {'Conditions':<20}
+{'-'*100}
+"""
+        
+        # Add all prints in order
+        for i, p in enumerate(self.phantom_prints, 1):
+            conditions_str = ','.join(str(c) for c in p['conditions'][:5])
+            if len(p['conditions']) > 5:
+                conditions_str += '...'
+            
+            summary += f"{i:<5} {p['time_est']:<12} ${p['price']:<9.2f} {p['size']:>11,} ${p['distance']:>11.2f} {p['exchange']:<10} {conditions_str:<20}\n"
+        
+        summary += f"\n{'='*100}\n"
+        summary += f"Log file saved to: {self.csv_file}\n"
+        summary += f"{'='*100}\n"
+        
+        return summary
+    
+    def get_discord_summary(self):
+        """
+        Generate Discord-friendly summary
+        """
+        if not self.phantom_prints:
+            return None
+        
+        msg = f"👻 **PhantomSpot Summary - {self.ticker}**\n"
+        msg += f"**{self.today}**\n\n"
+        msg += f"**Statistics:**\n"
+        msg += f"• Total Prints: **{len(self.phantom_prints)}**\n"
+        msg += f"• Price Range: **${min(p['price'] for p in self.phantom_prints):.2f} - ${max(p['price'] for p in self.phantom_prints):.2f}**\n\n"
+        
+        msg += f"**All Prints (Chronological):**\n```\n"
+        msg += f"{'#':<4} {'Time':<9} {'Price':<8} {'Size':<10}\n"
+        msg += f"{'-'*35}\n"
+        
+        for i, p in enumerate(self.phantom_prints, 1):
+            msg += f"{i:<4} {p['time_est'][:8]:<9} ${p['price']:<7.2f} {p['size']:>9,}\n"
+        
+        msg += "```"
+        
+        return msg
+    
+    async def save_summary(self):
+        """Save daily summary to file and send to Discord"""
+        summary = self.get_daily_summary()
+        summary_file = self.log_dir / f"summary_phantoms_{self.ticker}_{self.today}.txt"
         with open(summary_file, 'w') as f:
             f.write(summary)
         print(summary, flush=True)
@@ -894,6 +1083,10 @@ async def run():
     dark_pool_tracker = DarkPoolTracker(SYMBOL, DARK_POOL_SIZE_THRESHOLD)
     print("✅ Dark pool tracker ENABLED", flush=True)
     
+    # Initialize phantom print tracker
+    phantom_tracker = PhantomPrintTracker(SYMBOL)
+    print("✅ Phantom print tracker ENABLED", flush=True)
+    
     # Session ranges
     today_low = None
     today_high = None
@@ -988,6 +1181,11 @@ async def run():
                                 print("🕐 Market closed. Generating dark pool summary...", flush=True)
                                 await dark_pool_tracker.save_summary()
                             
+                            # Generate phantom print summary
+                            if phantom_tracker.phantom_prints:
+                                print("🕐 Market closed. Generating phantom print summary...", flush=True)
+                                await phantom_tracker.save_summary()
+                            
                             summary_generated_today = True
                             last_summary_date = current_date
                         
@@ -1012,6 +1210,19 @@ async def run():
                                 'trf_id': trf_id
                             }
                             zero_logger.log_zero_trade(zero_trade_data)
+                            
+                            # Send immediate Discord alert
+                            exchange_name = zero_logger.get_exchange_name(exch)
+                            zero_msg = (
+                                f"🔍 **Zero-Size Trade Detected**\n"
+                                f"Price: **${price}**\n"
+                                f"Exchange: {exchange_name} ({exch})\n"
+                                f"Conditions: {conds}\n"
+                                f"SIP Time: {datetime.fromtimestamp(sip_ts_raw/1000, tz=ET)}\n"
+                                f"Sequence: {sequence}\n"
+                                f"TRF ID: {trf_id}"
+                            )
+                            asyncio.create_task(send_discord(zero_msg))
 
                         # Update session-specific categories FIRST (needed for categorization)
                         in_premarket = time(4, 0) <= tm < time(9, 30)
@@ -1186,6 +1397,19 @@ async def run():
                                 flush=True
                             )
                             
+                            # LOG TO PHANTOM TRACKER
+                            phantom_trade_data = {
+                                'price': price,
+                                'size': size,
+                                'exchange': exch,
+                                'conditions': conds,
+                                'sequence': sequence,
+                                'sip_timestamp': sip_ts_raw,
+                                'trf_timestamp': trf_ts_raw,
+                                'trf_id': trf_id
+                            }
+                            phantom_tracker.log_phantom_print(phantom_trade_data, distance)
+                            
                             # ALWAYS SEND TO DISCORD
                             msg = (
                                 f"🚨 **Phantom Print Detected**\n"
@@ -1281,6 +1505,9 @@ async def run():
             if dark_pool_tracker.dark_pool_prints:
                 print("📊 Generating dark pool summary before reconnecting...", flush=True)
                 await dark_pool_tracker.save_summary()
+            if phantom_tracker.phantom_prints:
+                print("📊 Generating phantom print summary before reconnecting...", flush=True)
+                await phantom_tracker.save_summary()
             print("🔁 Reconnecting in 5 seconds...", flush=True)
             await asyncio.sleep(5)
         except Exception as e:
@@ -1294,6 +1521,9 @@ async def run():
             if dark_pool_tracker.dark_pool_prints:
                 print("📊 Generating dark pool summary before reconnecting...", flush=True)
                 await dark_pool_tracker.save_summary()
+            if phantom_tracker.phantom_prints:
+                print("📊 Generating phantom print summary before reconnecting...", flush=True)
+                await phantom_tracker.save_summary()
             print("🔁 Reconnecting in 5 seconds...", flush=True)
             await asyncio.sleep(5)
 
@@ -1303,6 +1533,7 @@ if __name__ == "__main__":
     # Global references for signal handler
     global_zero_logger = None
     global_dark_pool_tracker = None
+    global_phantom_tracker = None
     
     def signal_handler(signum, frame):
         """Handle shutdown signals and generate final summaries"""
@@ -1320,6 +1551,14 @@ if __name__ == "__main__":
         if global_dark_pool_tracker and global_dark_pool_tracker.dark_pool_prints:
             summary = global_dark_pool_tracker.get_daily_summary()
             summary_file = global_dark_pool_tracker.log_dir / f"summary_dark_pool_{global_dark_pool_tracker.ticker}_{global_dark_pool_tracker.today}.txt"
+            with open(summary_file, 'w') as f:
+                f.write(summary)
+            print(summary, flush=True)
+        
+        # Phantom print summary
+        if global_phantom_tracker and global_phantom_tracker.phantom_prints:
+            summary = global_phantom_tracker.get_daily_summary()
+            summary_file = global_phantom_tracker.log_dir / f"summary_phantoms_{global_phantom_tracker.ticker}_{global_phantom_tracker.today}.txt"
             with open(summary_file, 'w') as f:
                 f.write(summary)
             print(summary, flush=True)
