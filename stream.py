@@ -118,23 +118,28 @@ class ZeroSizeTradeLogger:
         self.log_dir = Path("/tmp/zero_size_logs")
         self.log_dir.mkdir(exist_ok=True)
         
-        # Create daily log file
-        self.today = datetime.now(ET).strftime('%Y-%m-%d')
-        self.csv_file = self.log_dir / f"zero_trades_{self.ticker}_{self.today}.csv"
-        self.json_file = self.log_dir / f"zero_trades_{self.ticker}_{self.today}.json"
-        
         # In-memory storage for session
         self.zero_trades = []
         
-        # Initialize CSV with headers
-        self.init_csv()
-        
         print(f"📊 Zero-size logger initialized. Logs: {self.log_dir}", flush=True)
+    
+    def get_today_str(self):
+        """Get current date string - always fresh"""
+        return datetime.now(ET).strftime('%Y-%m-%d')
+    
+    def get_csv_file(self):
+        """Get CSV file path for current date"""
+        return self.log_dir / f"zero_trades_{self.ticker}_{self.get_today_str()}.csv"
+    
+    def get_json_file(self):
+        """Get JSON file path for current date"""
+        return self.log_dir / f"zero_trades_{self.ticker}_{self.get_today_str()}.json"
         
     def init_csv(self):
         """Create CSV file with headers if it doesn't exist"""
-        if not self.csv_file.exists():
-            with open(self.csv_file, 'w', newline='') as f:
+        csv_file = self.get_csv_file()
+        if not csv_file.exists():
+            with open(csv_file, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     'Timestamp_MS',
@@ -193,7 +198,10 @@ class ZeroSizeTradeLogger:
     
     def write_to_csv(self, record):
         """Append record to CSV file"""
-        with open(self.csv_file, 'a', newline='') as f:
+        # Initialize CSV if needed (handles day change)
+        self.init_csv()
+        csv_file = self.get_csv_file()
+        with open(csv_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
                 record['timestamp_ms'],
@@ -211,9 +219,10 @@ class ZeroSizeTradeLogger:
     
     def write_to_json(self, record):
         """Append record to JSON file"""
+        json_file = self.get_json_file()
         # Read existing data
-        if self.json_file.exists():
-            with open(self.json_file, 'r') as f:
+        if json_file.exists():
+            with open(json_file, 'r') as f:
                 try:
                     data = json.load(f)
                 except json.JSONDecodeError:
@@ -225,7 +234,7 @@ class ZeroSizeTradeLogger:
         data.append(record)
         
         # Write back
-        with open(self.json_file, 'w') as f:
+        with open(json_file, 'w') as f:
             json.dump(data, f, indent=2)
     
     def print_zero_trade(self, record):
@@ -298,7 +307,7 @@ class ZeroSizeTradeLogger:
         
         summary = f"""
 {'='*80}
-ZERO-SIZE TRADE SUMMARY - {self.ticker} - {self.today}
+ZERO-SIZE TRADE SUMMARY - {self.ticker} - {self.get_today_str()}
 {'='*80}
 
 Total Zero-Size Trades: {len(self.zero_trades)}
@@ -318,8 +327,8 @@ First: {self.zero_trades[0]['time_est']}
 Last:  {self.zero_trades[-1]['time_est']}
 
 Log files saved to:
-CSV:  {self.csv_file}
-JSON: {self.json_file}
+CSV:  {self.get_csv_file()}
+JSON: {self.get_json_file()}
 
 {'='*80}
 """
@@ -334,7 +343,7 @@ JSON: {self.json_file}
     async def save_summary(self):
         """Save daily summary to file and send to Discord"""
         summary = self.get_daily_summary()
-        summary_file = self.log_dir / f"summary_{self.ticker}_{self.today}.txt"
+        summary_file = self.log_dir / f"summary_{self.ticker}_{self.get_today_str()}.txt"
         with open(summary_file, 'w') as f:
             f.write(summary)
         print(summary, flush=True)
@@ -387,22 +396,24 @@ class DarkPoolTracker:
         self.log_dir = Path("/tmp/dark_pool_logs")
         self.log_dir.mkdir(exist_ok=True)
         
-        # Create daily log file
-        self.today = datetime.now(ET).strftime('%Y-%m-%d')
-        self.csv_file = self.log_dir / f"dark_pool_{self.ticker}_{self.today}.csv"
-        
         # In-memory storage for session
         self.dark_pool_prints = []
         
-        # Initialize CSV with headers
-        self.init_csv()
-        
         print(f"🟣 Dark pool tracker initialized. Threshold: {size_threshold:,} shares", flush=True)
+    
+    def get_today_str(self):
+        """Get current date string - always fresh"""
+        return datetime.now(ET).strftime('%Y-%m-%d')
+    
+    def get_csv_file(self):
+        """Get CSV file path for current date"""
+        return self.log_dir / f"dark_pool_{self.ticker}_{self.get_today_str()}.csv"
         
     def init_csv(self):
         """Create CSV file with headers if it doesn't exist"""
-        if not self.csv_file.exists():
-            with open(self.csv_file, 'w', newline='') as f:
+        csv_file = self.get_csv_file()
+        if not csv_file.exists():
+            with open(csv_file, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     'Timestamp_MS',
@@ -453,7 +464,10 @@ class DarkPoolTracker:
     
     def write_to_csv(self, record):
         """Append record to CSV file"""
-        with open(self.csv_file, 'a', newline='') as f:
+        # Initialize CSV if needed (handles day change)
+        self.init_csv()
+        csv_file = self.get_csv_file()
+        with open(csv_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
                 record['timestamp_ms'],
@@ -493,7 +507,7 @@ class DarkPoolTracker:
         # Build summary text
         summary = f"""
 {'='*100}
-LARGE DARK POOL PRINTS SUMMARY - {self.ticker} - {self.today}
+LARGE DARK POOL PRINTS SUMMARY - {self.ticker} - {self.get_today_str()}
 {'='*100}
 
 STATISTICS:
@@ -545,7 +559,7 @@ TOP PRINTS BY NOTIONAL VALUE
                 summary += f"${price:<9.2f} {count:<8} {total_size:>17,} ${total_not:>19,.2f}\n"
         
         summary += f"\n{'='*100}\n"
-        summary += f"Log file saved to: {self.csv_file}\n"
+        summary += f"Log file saved to: {self.get_csv_file()}\n"
         summary += f"{'='*100}\n"
         
         return summary
@@ -565,7 +579,7 @@ TOP PRINTS BY NOTIONAL VALUE
         
         # Build Discord message
         msg = f"🟣 **Large Dark Pool Prints (≥100k) Summary - {self.ticker}**\n"
-        msg += f"**{self.today}**\n\n"
+        msg += f"**{self.get_today_str()}**\n\n"
         msg += f"**Statistics:**\n"
         msg += f"• Total Prints: **{total_prints}**\n"
         msg += f"• Total Volume: **{total_volume:,} shares**\n"
@@ -610,7 +624,7 @@ TOP PRINTS BY NOTIONAL VALUE
     async def save_summary(self):
         """Save daily summary to file and send to Discord"""
         summary = self.get_daily_summary()
-        summary_file = self.log_dir / f"summary_dark_pool_{self.ticker}_{self.today}.txt"
+        summary_file = self.log_dir / f"summary_dark_pool_{self.ticker}_{self.get_today_str()}.txt"
         with open(summary_file, 'w') as f:
             f.write(summary)
         print(summary, flush=True)
@@ -637,22 +651,24 @@ class PhantomPrintTracker:
         self.log_dir = Path("/tmp/phantom_logs")
         self.log_dir.mkdir(exist_ok=True)
         
-        # Create daily log file
-        self.today = datetime.now(ET).strftime('%Y-%m-%d')
-        self.csv_file = self.log_dir / f"phantoms_{self.ticker}_{self.today}.csv"
-        
         # In-memory storage for session
         self.phantom_prints = []
         
-        # Initialize CSV with headers
-        self.init_csv()
-        
         print(f"👻 Phantom print tracker initialized.", flush=True)
+    
+    def get_today_str(self):
+        """Get current date string - always fresh"""
+        return datetime.now(ET).strftime('%Y-%m-%d')
+    
+    def get_csv_file(self):
+        """Get CSV file path for current date"""
+        return self.log_dir / f"phantoms_{self.ticker}_{self.get_today_str()}.csv"
         
     def init_csv(self):
         """Create CSV file with headers if it doesn't exist"""
-        if not self.csv_file.exists():
-            with open(self.csv_file, 'w', newline='') as f:
+        csv_file = self.get_csv_file()
+        if not csv_file.exists():
+            with open(csv_file, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     'Timestamp_MS',
@@ -707,7 +723,10 @@ class PhantomPrintTracker:
     
     def write_to_csv(self, record):
         """Append record to CSV file"""
-        with open(self.csv_file, 'a', newline='') as f:
+        # Initialize CSV if needed (handles day change)
+        self.init_csv()
+        csv_file = self.get_csv_file()
+        with open(csv_file, 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
                 record['timestamp_ms'],
@@ -732,7 +751,7 @@ class PhantomPrintTracker:
         
         summary = f"""
 {'='*100}
-PHANTOM PRINTS SUMMARY - {self.ticker} - {self.today}
+PHANTOM PRINTS SUMMARY - {self.ticker} - {self.get_today_str()}
 {'='*100}
 
 STATISTICS:
@@ -757,7 +776,7 @@ ALL PHANTOM PRINTS (Chronological Order)
             summary += f"{i:<5} {p['time_est']:<12} ${p['price']:<9.2f} {p['size']:>11,} ${p['distance']:>11.2f} {p['exchange']:<10} {conditions_str:<20}\n"
         
         summary += f"\n{'='*100}\n"
-        summary += f"Log file saved to: {self.csv_file}\n"
+        summary += f"Log file saved to: {self.get_csv_file()}\n"
         summary += f"{'='*100}\n"
         
         return summary
@@ -770,7 +789,7 @@ ALL PHANTOM PRINTS (Chronological Order)
             return None
         
         msg = f"👻 **PhantomSpot Summary - {self.ticker}**\n"
-        msg += f"**{self.today}**\n\n"
+        msg += f"**{self.get_today_str()}**\n\n"
         msg += f"**Statistics:**\n"
         msg += f"• Total Prints: **{len(self.phantom_prints)}**\n"
         msg += f"• Price Range: **${min(p['price'] for p in self.phantom_prints):.2f} - ${max(p['price'] for p in self.phantom_prints):.2f}**\n\n"
@@ -789,7 +808,7 @@ ALL PHANTOM PRINTS (Chronological Order)
     async def save_summary(self):
         """Save daily summary to file and send to Discord"""
         summary = self.get_daily_summary()
-        summary_file = self.log_dir / f"summary_phantoms_{self.ticker}_{self.today}.txt"
+        summary_file = self.log_dir / f"summary_phantoms_{self.ticker}_{self.get_today_str()}.txt"
         with open(summary_file, 'w') as f:
             f.write(summary)
         print(summary, flush=True)
