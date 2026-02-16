@@ -47,11 +47,22 @@ DARK_POOL_SIZE_THRESHOLD = 100000  # Alert on dark pool trades above this size
 
 # Velocity divergence settings
 VELOCITY_ENABLED = os.environ.get("VELOCITY_ENABLED", "true").lower() in ("true", "1", "yes")
-VELOCITY_WINDOW_SEC = 30  # Rolling window size in seconds
-VELOCITY_DROP_THRESHOLD = 0.5  # 50% velocity drop = divergence
-VELOCITY_CONFIRMATION_WINDOWS = 2  # Require 2 consecutive windows to confirm
-VELOCITY_COOLDOWN = 180  # 3 minutes between divergence alerts
-VELOCITY_MIN_TRADES_PER_WINDOW = 10  # Need at least this many trades to be meaningful
+
+# PHASE 1: Option 1 (Relaxed) - Current settings
+# These defaults provide quality signals without being too strict
+# All values can be overridden via Railway environment variables
+VELOCITY_WINDOW_SEC = int(os.environ.get("VELOCITY_WINDOW_SEC", "60"))  # 60 seconds (was 30)
+VELOCITY_DROP_THRESHOLD = float(os.environ.get("VELOCITY_DROP_THRESHOLD", "0.30"))  # 30% drop (was 50%)
+VELOCITY_CONFIRMATION_WINDOWS = int(os.environ.get("VELOCITY_CONFIRMATION_WINDOWS", "1"))  # 1 window (was 2)
+VELOCITY_COOLDOWN = int(os.environ.get("VELOCITY_COOLDOWN", "300"))  # 5 minutes between alerts
+VELOCITY_MIN_TRADES_PER_WINDOW = int(os.environ.get("VELOCITY_MIN_TRADES_PER_WINDOW", "20"))  # 20 trades minimum
+
+# PHASE 2: Option 3 (Institutional Grade) - Coming soon!
+# When ready to upgrade, these will enable:
+# - OR logic (alert on EITHER trade OR volume drop, not requiring both)
+# - Exhaustion detection (new high/low on declining volume)
+# - Acceleration divergence (price speeding up while participation slows down)
+# Will add 3 types of divergence signals instead of 1 for better coverage!
 
 # Phantom thresholds
 PHANTOM_OUTSIDE_PREV = 0.10
