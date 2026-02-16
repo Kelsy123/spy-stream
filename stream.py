@@ -1046,6 +1046,81 @@ def fetch_prev_day_range_massive(symbol, massive_api_key):
 # ======================================================
 # POSTGRES INIT
 # ======================================================
+# ======================================================
+# MARKET HOLIDAY CHECKER
+# ======================================================
+async def is_market_holiday():
+    """
+    Check if today is a market holiday or weekend
+    Uses Massive.com market holidays API
+    Returns: True if market is closed (holiday/weekend), False if open
+    """
+    today = datetime.now(ET).date()
+    
+    # Check if weekend
+    if today.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        print(f"📅 {today} is a weekend - market closed", flush=True)
+        return True
+    
+    # Check Massive.com API for market holidays
+    try:
+        url = f"https://api.massive.io/v1/reference/market-holidays/{today.year}"
+        headers = {"Authorization": f"Bearer {MASSIVE_API_KEY}"}
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    holidays = data.get('holidays', [])
+                    
+                    # Check if today matches any holiday
+                    today_str = today.strftime('%Y-%m-%d')
+                    for holiday in holidays:
+                        holiday_date = holiday.get('date', '')
+                        if holiday_date == today_str:
+                            holiday_name = holiday.get('name', 'Market Holiday')
+                            print(f"📅 {today} is {holiday_name} - market closed", flush=True)
+                            return True
+                    
+                    print(f"📅 {today} is a trading day - market open", flush=True)
+                    return False
+                else:
+                    print(f"⚠️ Could not check market holidays (API returned {response.status}), assuming market is open", flush=True)
+                    return False
+    except Exception as e:
+        print(f"⚠️ Error checking market holidays: {e}, assuming market is open", flush=True)
+        return False
+
+# ======================================================
+# POSTGRES CONNECTION WITH AUTO-RECONNECT
+# ======================================================
+async def ensure_db_connection(db):
+    """
+    Ensure database connection is alive, reconnect if needed
+    Returns: Valid database connection
+    """
+    try:
+        # Test if connection is alive with a simple query
+        await db.execute("SELECT 1")
+        return db
+    except Exception as e:
+        print(f"⚠️ Database connection lost: {e}", flush=True)
+        print("🔄 Reconnecting to database...", flush=True)
+        try:
+            # Close old connection if possible
+            try:
+                await db.close()
+            except:
+                pass
+            
+            # Create new connection
+            new_db = await asyncpg.connect(POSTGRES_URL)
+            print("✅ Database reconnected successfully", flush=True)
+            return new_db
+        except Exception as reconnect_error:
+            print(f"❌ Failed to reconnect to database: {reconnect_error}", flush=True)
+            raise
+
 async def init_postgres():
     conn = await asyncpg.connect(POSTGRES_URL)
     await conn.execute("""
@@ -1184,26 +1259,32 @@ async def run():
                         # ====================================================================
                         # END-OF-DAY SUMMARY GENERATION
                         # Generate summary once after market close
+                        # Skip weekends and market holidays
                         # ====================================================================
                         current_date = datetime.now(ET).date()
                         is_after_close = tm >= time(20, 0)  # After 8 PM ET
                         
                         if is_after_close and not summary_generated_today and (last_summary_date is None or last_summary_date < current_date):
+                            # Check if today was a trading day (not weekend/holiday)
+                            is_holiday = await is_market_holiday()
                             
-                            # Generate zero-size summary
-                            if zero_logger and zero_logger.zero_trades:
-                                print("🕐 Market closed. Generating zero-size trade summary...", flush=True)
-                                await zero_logger.save_summary()
-                            
-                            # Generate dark pool summary
-                            if dark_pool_tracker.dark_pool_prints:
-                                print("🕐 Market closed. Generating dark pool summary...", flush=True)
-                                await dark_pool_tracker.save_summary()
-                            
-                            # Generate phantom print summary
-                            if phantom_tracker.phantom_prints:
-                                print("🕐 Market closed. Generating phantom print summary...", flush=True)
-                                await phantom_tracker.save_summary()
+                            if not is_holiday:
+                                # Generate zero-size summary
+                                if zero_logger and zero_logger.zero_trades:
+                                    print("🕐 Market closed. Generating zero-size trade summary...", flush=True)
+                                    await zero_logger.save_summary()
+                                
+                                # Generate dark pool summary
+                                if dark_pool_tracker.dark_pool_prints:
+                                    print("🕐 Market closed. Generating dark pool summary...", flush=True)
+                                    await dark_pool_tracker.save_summary()
+                                
+                                # Generate phantom print summary
+                                if phantom_tracker.phantom_prints:
+                                    print("🕐 Market closed. Generating phantom print summary...", flush=True)
+                                    await phantom_tracker.save_summary()
+                            else:
+                                print("📅 Skipping summaries - market was closed today (weekend/holiday)", flush=True)
                             
                             summary_generated_today = True
                             last_summary_date = current_date
@@ -1431,7 +1512,7 @@ async def run():
                             
                             # ALWAYS SEND TO DISCORD
                             msg = (
-                                f"🚨 **Phantom Print Detected**\n"
+                                f"🚨 **{SYMBOL} Phantom Print Detected**\n"
                                 f"Price: **${price}**\n"
                                 f"Size: {size}\n"
                                 f"Exchange: {exch}\n"
@@ -1446,20 +1527,25 @@ async def run():
                             )
                             asyncio.create_task(send_discord(msg))
                             
-                            # INSERT INTO POSTGRES
-                            await db.execute("""
-                            INSERT INTO phantoms (
-                                ts, sip_ts, trf_ts, price, size,
-                                conditions, exchange, sequence, trf_id
-                            )
-                            VALUES (
-                                NOW(),
-                                to_timestamp($1 / 1000.0),
-                                to_timestamp($2 / 1000.0),
-                                $3, $4, $5, $6, $7, $8
-                            );
-                            """, sip_ts_raw, trf_ts_raw or sip_ts_raw, price, size,
-                            json.dumps(conds), exch, sequence, trf_id)
+                            # INSERT INTO POSTGRES (with connection check)
+                            try:
+                                db = await ensure_db_connection(db)
+                                await db.execute("""
+                                INSERT INTO phantoms (
+                                    ts, sip_ts, trf_ts, price, size,
+                                    conditions, exchange, sequence, trf_id
+                                )
+                                VALUES (
+                                    NOW(),
+                                    to_timestamp($1 / 1000.0),
+                                    to_timestamp($2 / 1000.0),
+                                    $3, $4, $5, $6, $7, $8
+                                );
+                                """, sip_ts_raw, trf_ts_raw or sip_ts_raw, price, size,
+                                json.dumps(conds), exch, sequence, trf_id)
+                            except Exception as db_error:
+                                print(f"⚠️ Failed to insert phantom to database: {db_error}", flush=True)
+                                # Continue execution even if database insert fails
                             
                             # WINDOW LOGIC
                             if now - last_phantom_alert > PHANTOM_COOLDOWN:
@@ -1517,33 +1603,28 @@ async def run():
                                     
         except websockets.exceptions.ConnectionClosed as e:
             print(f"⚠️ Websocket closed: {e}", flush=True)
-            # Generate summaries if data exists
-            if zero_logger and zero_logger.zero_trades:
-                print("📊 Generating zero-size trade summary before reconnecting...", flush=True)
-                await zero_logger.save_summary()
-            if dark_pool_tracker.dark_pool_prints:
-                print("📊 Generating dark pool summary before reconnecting...", flush=True)
-                await dark_pool_tracker.save_summary()
-            if phantom_tracker.phantom_prints:
-                print("📊 Generating phantom print summary before reconnecting...", flush=True)
-                await phantom_tracker.save_summary()
             print("🔁 Reconnecting in 5 seconds...", flush=True)
             await asyncio.sleep(5)
         except Exception as e:
-            print(f"⚠️ Unexpected error: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
-            # Generate summaries if data exists
-            if zero_logger and zero_logger.zero_trades:
-                print("📊 Generating zero-size trade summary before reconnecting...", flush=True)
-                await zero_logger.save_summary()
-            if dark_pool_tracker.dark_pool_prints:
-                print("📊 Generating dark pool summary before reconnecting...", flush=True)
-                await dark_pool_tracker.save_summary()
-            if phantom_tracker.phantom_prints:
-                print("📊 Generating phantom print summary before reconnecting...", flush=True)
-                await phantom_tracker.save_summary()
-            print("🔁 Reconnecting in 5 seconds...", flush=True)
+            # Don't generate summaries on every error - this was causing spam
+            # Only database connection errors should be handled gracefully
+            error_msg = str(e)
+            
+            # If it's a database error, just log it and continue
+            if "connection is closed" in error_msg.lower() or "asyncpg" in error_msg.lower():
+                print(f"⚠️ Database connection error (will auto-reconnect): {e}", flush=True)
+                # Try to reconnect database
+                try:
+                    db = await ensure_db_connection(db)
+                except:
+                    print("⚠️ Database reconnection failed, will retry on next operation", flush=True)
+            else:
+                # For other errors, print full traceback
+                print(f"⚠️ Unexpected error: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+            
+            print("🔁 Reconnecting websocket in 5 seconds...", flush=True)
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
