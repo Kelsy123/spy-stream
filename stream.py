@@ -1222,7 +1222,11 @@ async def run():
     
     while True:
         try:
-            async with websockets.connect(WS_URL) as ws:
+            async with websockets.connect(
+                WS_URL,
+                ping_interval=20,  # Send keepalive ping every 20 seconds
+                ping_timeout=10    # Wait 10 seconds for pong response
+            ) as ws:
                 # Authenticate
                 auth_msg = {"action": "auth", "params": MASSIVE_API_KEY}
                 await ws.send(json.dumps(auth_msg))
