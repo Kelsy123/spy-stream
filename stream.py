@@ -410,6 +410,11 @@ class DarkPoolTracker:
         # In-memory storage for session
         self.dark_pool_prints = []
         
+        # Batching system for Discord alerts
+        self.pending_batch = []  # Prints waiting to be batched
+        self.batch_task = None   # Background task for batch delay
+        self.batch_delay = 3     # Wait 3 seconds to collect similar prints
+        
         print(f"🟣 Dark pool tracker initialized. Threshold: {size_threshold:,} shares", flush=True)
     
     def get_today_str(self):
@@ -631,6 +636,125 @@ TOP PRINTS BY NOTIONAL VALUE
             msg += "```"
         
         return msg
+    
+    async def queue_for_alert(self, trade_record):
+        """
+        Add print to batch queue and schedule alert
+        Individual prints are STILL logged to dark_pool_prints list immediately
+        This only affects Discord alerts, not data tracking
+        """
+        self.pending_batch.append(trade_record)
+        
+        # Cancel existing batch timer if there is one
+        if self.batch_task and not self.batch_task.done():
+            self.batch_task.cancel()
+        
+        # Start new batch timer (3 seconds)
+        self.batch_task = asyncio.create_task(self._send_batched_alert())
+    
+    async def _send_batched_alert(self):
+        """
+        Wait for batch_delay seconds, then send alert(s)
+        If more prints come in during wait, timer resets
+        """
+        try:
+            await asyncio.sleep(self.batch_delay)
+            
+            # After delay, check what we have
+            if not self.pending_batch:
+                return
+            
+            # Group by exact price
+            batches = self._group_by_price(self.pending_batch)
+            
+            # Send alerts for each price group
+            for price, prints in batches.items():
+                if len(prints) == 1:
+                    # Single print - send individual alert with all details
+                    await self._send_individual_alert(prints[0])
+                else:
+                    # Multiple prints at same price - send batched alert
+                    await self._send_batch_alert(prints)
+            
+            # Clear the batch
+            self.pending_batch = []
+            
+        except asyncio.CancelledError:
+            # Timer was cancelled because new print came in
+            # This is normal - the new print will restart the timer
+            pass
+    
+    def _group_by_price(self, prints):
+        """
+        Group prints by exact price only
+        Returns dict: {price: [list of prints at that price]}
+        """
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for p in prints:
+            groups[p['price']].append(p)
+        return groups
+    
+    async def _send_individual_alert(self, print_data):
+        """
+        Send single print alert - KEEPS CURRENT DETAILED FORMAT
+        """
+        msg = (
+            f"🟣 **Large Dark Pool Print**\n"
+            f"Price: **${print_data['price']}**\n"
+            f"Size: **{print_data['size']:,} shares**\n"
+            f"Notional: **${print_data['notional']:,.2f}**\n"
+            f"Conditions: {print_data['conditions']}\n"
+            f"SIP Time: {datetime.fromtimestamp(print_data['sip_timestamp']/1000, tz=ET)}\n"
+            f"Sequence: {print_data['sequence']}"
+        )
+        await send_discord(msg)
+    
+    async def _send_batch_alert(self, prints):
+        """
+        Send batched alert for multiple prints at exact same price
+        Shows totals and summary while keeping all individual data in tracker
+        """
+        # Sort by time
+        prints_sorted = sorted(prints, key=lambda x: x['timestamp_ms'])
+        
+        # Calculate totals
+        count = len(prints)
+        total_size = sum(p['size'] for p in prints)
+        total_notional = sum(p['notional'] for p in prints)
+        avg_size = total_size / count
+        price = prints[0]['price']  # All same price (exact match)
+        
+        # Time range
+        first_time = prints_sorted[0]['time_est']
+        last_time = prints_sorted[-1]['time_est']
+        
+        # Sequences (show first 3, then count remaining)
+        sequences = [str(p['sequence']) for p in prints_sorted]
+        if len(sequences) <= 3:
+            seq_str = ', '.join(sequences)
+        else:
+            seq_str = f"{', '.join(sequences[:3])}... (+{len(sequences)-3} more)"
+        
+        # Check if all conditions are the same
+        all_conditions = [str(p['conditions']) for p in prints]
+        if len(set(all_conditions)) == 1:
+            conditions_str = str(prints[0]['conditions'])
+        else:
+            conditions_str = "Multiple (see end-of-day summary)"
+        
+        msg = (
+            f"🟣🟣 **Dark Pool Print Cluster**\n"
+            f"Price: **${price}** (exact match)\n"
+            f"Count: **{count} prints**\n"
+            f"Total Size: **{total_size:,} shares**\n"
+            f"Total Notional: **${total_notional:,.2f}**\n"
+            f"Avg Size per Print: **{avg_size:,.0f} shares**\n"
+            f"Time Range: {first_time} - {last_time}\n"
+            f"Sequences: {seq_str}\n"
+            f"Conditions: {conditions_str}"
+        )
+        await send_discord(msg)
     
     async def save_summary(self):
         """Save daily summary to file and send to Discord"""
@@ -1572,7 +1696,7 @@ async def run():
                         # Dark pool large print detection
                         is_darkpool = (exch == 4)  # Exchange 4 is dark pool
                         if is_darkpool and size >= DARK_POOL_SIZE_THRESHOLD and not bad_conditions:
-                            # Log to tracker for end-of-day summary
+                            # Log to tracker for end-of-day summary (ALWAYS logged individually!)
                             dp_trade_data = {
                                 'price': price,
                                 'size': size,
@@ -1590,17 +1714,10 @@ async def run():
                                 flush=True
                             )
                             
-                            # Send immediate alert to Discord
-                            dp_msg = (
-                                f"🟣 **Large Dark Pool Print**\n"
-                                f"Price: **${price}**\n"
-                                f"Size: **{size:,} shares**\n"
-                                f"Notional: **${price * size:,.2f}**\n"
-                                f"Conditions: {conds}\n"
-                                f"SIP Time: {datetime.fromtimestamp(sip_ts_raw/1000, tz=ET)}\n"
-                                f"Sequence: {sequence}"
-                            )
-                            asyncio.create_task(send_discord(dp_msg))
+                            # Queue for smart batched Discord alert
+                            # If multiple prints at same price come quickly, they'll batch
+                            # If single print, sends after 3-second delay with full details
+                            asyncio.create_task(dark_pool_tracker.queue_for_alert(dp_trade_data))
                         
                         # RTH breakout logic
                         if in_rth and not bad_conditions:
