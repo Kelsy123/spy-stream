@@ -449,6 +449,9 @@ class DarkPoolTracker:
         
         Args:
             trade_data: Dictionary with Massive.com trade fields
+        
+        Returns:
+            Complete trade_record with calculated notional value
         """
         timestamp_ms = trade_data.get('sip_timestamp', 0)
         timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=ET)
@@ -475,6 +478,9 @@ class DarkPoolTracker:
         
         # Write to CSV
         self.write_to_csv(trade_record)
+        
+        # Return the complete record for batching
+        return trade_record
         
         return trade_record
     
@@ -1007,7 +1013,12 @@ class VelocityWindow:
 
 def detect_velocity_divergence(windows, session_high, session_low):
     """
-    Detect velocity divergence - price makes new high/low but velocity drops
+    OPTION 3: Institutional Grade Velocity Divergence Detection
+    
+    Three types of divergence signals:
+    1. Classic Divergence (OR logic - either metric can trigger)
+    2. Exhaustion (new extreme on weak volume)
+    3. Acceleration Divergence (price speeding up, participation slowing)
     
     Returns: (is_divergence, alert_data) tuple
     """
@@ -1046,14 +1057,29 @@ def detect_velocity_divergence(windows, session_high, session_low):
     trade_vel_drop_pct = 1 - (current_metrics['trade_velocity'] / avg_prev_trade_vel)
     volume_vel_drop_pct = 1 - (current_metrics['volume_velocity'] / avg_prev_volume_vel)
     
-    # Divergence detected if BOTH velocities dropped by threshold
+    # OPTION 3: OR Logic + Extreme Threshold
+    # Trigger if EITHER velocity drops significantly, OR both drop moderately
+    EXTREME_THRESHOLD = 0.50  # 50% drop in one metric = instant trigger
+    
     is_divergence = (
-        trade_vel_drop_pct >= VELOCITY_DROP_THRESHOLD and
-        volume_vel_drop_pct >= VELOCITY_DROP_THRESHOLD
+        # Extreme drop in either metric alone
+        trade_vel_drop_pct >= EXTREME_THRESHOLD or
+        volume_vel_drop_pct >= EXTREME_THRESHOLD or
+        # OR both drop moderately
+        (trade_vel_drop_pct >= VELOCITY_DROP_THRESHOLD and 
+         volume_vel_drop_pct >= VELOCITY_DROP_THRESHOLD)
     )
     
     if is_divergence:
+        # Determine signal strength
+        if trade_vel_drop_pct >= EXTREME_THRESHOLD or volume_vel_drop_pct >= EXTREME_THRESHOLD:
+            signal_strength = "STRONG"
+        else:
+            signal_strength = "MODERATE"
+        
         alert_data = {
+            'type': 'CLASSIC_DIVERGENCE',
+            'signal_strength': signal_strength,
             'direction': 'HIGH' if current_metrics['made_new_high'] else 'LOW',
             'price': current_metrics['highest_price'] if current_metrics['made_new_high'] else current_metrics['lowest_price'],
             'trade_vel_drop_pct': trade_vel_drop_pct * 100,
@@ -1063,6 +1089,137 @@ def detect_velocity_divergence(windows, session_high, session_low):
             'prev_avg_trades': avg_prev_trade_vel * VELOCITY_WINDOW_SEC,
             'session_high': session_high,
             'session_low': session_low
+        }
+        return True, alert_data
+    
+    return False, None
+
+def detect_exhaustion(windows):
+    """
+    OPTION 3: Exhaustion Detection
+    Price makes new extreme but on declining volume - classic exhaustion pattern
+    
+    Returns: (is_exhaustion, alert_data) tuple
+    """
+    if len(windows) < 4:  # Need at least 4 windows to establish average
+        return False, None
+    
+    current = windows[-1]
+    current_metrics = current.get_metrics()
+    
+    # Must make new high or low
+    if not (current_metrics['made_new_high'] or current_metrics['made_new_low']):
+        return False, None
+    
+    # Need minimum trades
+    if current_metrics['trade_count'] < VELOCITY_MIN_TRADES_PER_WINDOW:
+        return False, None
+    
+    # Calculate average volume of previous 3 windows
+    prev_volumes = [w.get_metrics()['total_volume'] for w in windows[-4:-1]]
+    avg_prev_volume = sum(prev_volumes) / len(prev_volumes)
+    
+    if avg_prev_volume == 0:
+        return False, None
+    
+    # Current volume as ratio of average
+    volume_ratio = current_metrics['total_volume'] / avg_prev_volume
+    
+    # Exhaustion = new extreme on <70% of average volume
+    if volume_ratio < 0.70:
+        alert_data = {
+            'type': 'EXHAUSTION',
+            'direction': 'HIGH' if current_metrics['made_new_high'] else 'LOW',
+            'price': current_metrics['highest_price'] if current_metrics['made_new_high'] else current_metrics['lowest_price'],
+            'volume_ratio_pct': volume_ratio * 100,
+            'current_volume': current_metrics['total_volume'],
+            'avg_prev_volume': avg_prev_volume,
+            'current_trade_count': current_metrics['trade_count']
+        }
+        return True, alert_data
+    
+    return False, None
+
+def detect_acceleration_divergence(windows):
+    """
+    OPTION 3: Acceleration Divergence
+    Price volatility increasing (range expanding) while velocity decreasing
+    Classic blow-off top or capitulation bottom pattern
+    
+    Returns: (is_divergence, alert_data) tuple
+    """
+    if len(windows) < 3:
+        return False, None
+    
+    # Get last 3 windows
+    w1, w2, w3 = windows[-3], windows[-2], windows[-1]
+    m1, m2, m3 = w1.get_metrics(), w2.get_metrics(), w3.get_metrics()
+    
+    # Need minimum trades in current window
+    if m3['trade_count'] < VELOCITY_MIN_TRADES_PER_WINDOW:
+        return False, None
+    
+    # Calculate price range (volatility) per window
+    def get_range(metrics):
+        if metrics['highest_price'] is None or metrics['lowest_price'] is None:
+            return 0
+        return abs(metrics['highest_price'] - metrics['lowest_price'])
+    
+    range1 = get_range(m1)
+    range2 = get_range(m2)
+    range3 = get_range(m3)
+    
+    if range1 == 0 or range2 == 0:
+        return False, None
+    
+    # Price volatility is accelerating (range expanding)
+    price_accelerating = range3 > range2 and range2 > range1
+    
+    # Calculate percentage increase in volatility
+    if price_accelerating:
+        volatility_increase_pct = ((range3 - range1) / range1) * 100
+    else:
+        return False, None
+    
+    # Velocity is decelerating
+    vel1 = m1['trade_velocity']
+    vel2 = m2['trade_velocity']
+    vel3 = m3['trade_velocity']
+    
+    if vel1 == 0:
+        return False, None
+    
+    velocity_declining = vel3 < vel2 < vel1
+    velocity_decrease_pct = ((vel1 - vel3) / vel1) * 100
+    
+    # Both conditions must be true
+    if price_accelerating and velocity_declining:
+        # Determine direction based on price movement
+        if m3['made_new_high']:
+            direction = "HIGH"
+            price = m3['highest_price']
+        elif m3['made_new_low']:
+            direction = "LOW"
+            price = m3['lowest_price']
+        else:
+            # Acceleration happening mid-range
+            direction = "MID-RANGE"
+            price = (m3['highest_price'] + m3['lowest_price']) / 2 if m3['highest_price'] else None
+        
+        if price is None:
+            return False, None
+        
+        alert_data = {
+            'type': 'ACCELERATION_DIVERGENCE',
+            'direction': direction,
+            'price': price,
+            'volatility_increase_pct': volatility_increase_pct,
+            'velocity_decrease_pct': velocity_decrease_pct,
+            'current_range': range3,
+            'previous_range': range1,
+            'current_velocity': vel3,
+            'previous_velocity': vel1,
+            'current_trade_count': m3['trade_count']
         }
         return True, alert_data
     
@@ -1579,12 +1736,22 @@ async def run():
                                 )
                                 
                                 if in_valid_window:
+                                    # OPTION 3: Check all three divergence types
+                                    
+                                    # 1. Classic Divergence (with OR logic)
                                     is_divergence, alert_data = detect_velocity_divergence(
                                         velocity_windows,
                                         today_high if today_high else 0,
                                         today_low if today_low else 0
                                     )
                                     
+                                    # 2. Exhaustion Detection
+                                    is_exhaustion, exhaustion_data = detect_exhaustion(velocity_windows)
+                                    
+                                    # 3. Acceleration Divergence
+                                    is_acceleration, acceleration_data = detect_acceleration_divergence(velocity_windows)
+                                    
+                                    # Handle Classic Divergence Alert
                                     if is_divergence:
                                         velocity_confirmation_count += 1
                                         
@@ -1595,17 +1762,22 @@ async def run():
                                             last_velocity_alert = now
                                             velocity_confirmation_count = 0  # Reset counter
                                             
+                                            # Determine emoji based on signal strength
+                                            emoji = "⚡⚡" if alert_data.get('signal_strength') == 'STRONG' else "⚡"
+                                            
                                             print(
-                                                f"⚡ VELOCITY DIVERGENCE {ts_str()} "
+                                                f"{emoji} VELOCITY DIVERGENCE {ts_str()} "
                                                 f"{alert_data['direction']} @ ${alert_data['price']:.2f} "
                                                 f"trade_vel_drop={alert_data['trade_vel_drop_pct']:.1f}% "
-                                                f"volume_vel_drop={alert_data['volume_vel_drop_pct']:.1f}%",
+                                                f"volume_vel_drop={alert_data['volume_vel_drop_pct']:.1f}% "
+                                                f"strength={alert_data.get('signal_strength', 'MODERATE')}",
                                                 flush=True
                                             )
                                             
-                                            # Send to Discord
+                                            # Send to Discord with signal strength indicator
                                             vel_msg = (
-                                                f"⚡ **Velocity Divergence Detected**\n"
+                                                f"{emoji} **Velocity Divergence Detected**\n"
+                                                f"Signal Strength: **{alert_data.get('signal_strength', 'MODERATE')}**\n"
                                                 f"Direction: **{alert_data['direction']}** at **${alert_data['price']:.2f}**\n"
                                                 f"Trade Velocity Drop: **{alert_data['trade_vel_drop_pct']:.1f}%**\n"
                                                 f"Volume Velocity Drop: **{alert_data['volume_vel_drop_pct']:.1f}%**\n"
@@ -1613,12 +1785,70 @@ async def run():
                                                 f"{alert_data['current_volume']:,} shares\n"
                                                 f"Previous Avg: {alert_data['prev_avg_trades']:.0f} trades per window\n"
                                                 f"Session Range: [{alert_data['session_low']:.2f}, {alert_data['session_high']:.2f}]\n"
-                                                f"Time: {ts_str()}"
+                                                f"Time: {ts_str()}\n\n"
+                                                f"💡 **What This Means:** Price made new {alert_data['direction'].lower()} but "
+                                                f"{'with significantly weaker' if alert_data.get('signal_strength') == 'STRONG' else 'with declining'} "
+                                                f"participation. Potential reversal or consolidation ahead."
                                             )
                                             asyncio.create_task(send_discord(vel_msg))
                                     else:
                                         # Reset confirmation counter if divergence not detected
                                         velocity_confirmation_count = 0
+                                    
+                                    # Handle Exhaustion Alert (separate from classic divergence)
+                                    if is_exhaustion and now - last_velocity_alert > VELOCITY_COOLDOWN:
+                                        last_velocity_alert = now
+                                        
+                                        print(
+                                            f"💀 EXHAUSTION DETECTED {ts_str()} "
+                                            f"{exhaustion_data['direction']} @ ${exhaustion_data['price']:.2f} "
+                                            f"volume={exhaustion_data['volume_ratio_pct']:.1f}% of avg "
+                                            f"({exhaustion_data['current_volume']:,} vs {exhaustion_data['avg_prev_volume']:,.0f})",
+                                            flush=True
+                                        )
+                                        
+                                        exh_msg = (
+                                            f"💀 **Exhaustion Pattern Detected**\n"
+                                            f"Direction: **{exhaustion_data['direction']}** at **${exhaustion_data['price']:.2f}**\n"
+                                            f"Volume Ratio: **{exhaustion_data['volume_ratio_pct']:.1f}%** of recent average\n"
+                                            f"Current Volume: **{exhaustion_data['current_volume']:,} shares**\n"
+                                            f"Recent Avg: **{exhaustion_data['avg_prev_volume']:,.0f} shares**\n"
+                                            f"Current Trades: {exhaustion_data['current_trade_count']}\n"
+                                            f"Time: {ts_str()}\n\n"
+                                            f"💡 **What This Means:** Price pushed to new {exhaustion_data['direction'].lower()} "
+                                            f"on only {exhaustion_data['volume_ratio_pct']:.0f}% of normal volume. "
+                                            f"Classic exhaustion - fewer participants willing to chase. "
+                                            f"{'Bearish reversal' if exhaustion_data['direction'] == 'HIGH' else 'Bullish reversal'} likely."
+                                        )
+                                        asyncio.create_task(send_discord(exh_msg))
+                                    
+                                    # Handle Acceleration Divergence Alert
+                                    if is_acceleration and now - last_velocity_alert > VELOCITY_COOLDOWN:
+                                        last_velocity_alert = now
+                                        
+                                        print(
+                                            f"🔥 ACCELERATION DIVERGENCE {ts_str()} "
+                                            f"{acceleration_data['direction']} @ ${acceleration_data['price']:.2f} "
+                                            f"volatility+{acceleration_data['volatility_increase_pct']:.1f}% "
+                                            f"velocity-{acceleration_data['velocity_decrease_pct']:.1f}%",
+                                            flush=True
+                                        )
+                                        
+                                        acc_msg = (
+                                            f"🔥 **Acceleration Divergence Detected**\n"
+                                            f"Direction: **{acceleration_data['direction']}** at **${acceleration_data['price']:.2f}**\n"
+                                            f"Volatility Increase: **+{acceleration_data['volatility_increase_pct']:.1f}%**\n"
+                                            f"Velocity Decrease: **-{acceleration_data['velocity_decrease_pct']:.1f}%**\n"
+                                            f"Current Range: **${acceleration_data['current_range']:.2f}**\n"
+                                            f"Previous Range: **${acceleration_data['previous_range']:.2f}**\n"
+                                            f"Current Trades: {acceleration_data['current_trade_count']}\n"
+                                            f"Time: {ts_str()}\n\n"
+                                            f"💡 **What This Means:** Price is moving faster (wider ranges) but "
+                                            f"with fewer participants (declining velocity). Classic blow-off pattern. "
+                                            f"{'Buyers exhausting at top' if acceleration_data['direction'] == 'HIGH' else 'Sellers exhausting at bottom'}. "
+                                            f"Sharp reversal often follows."
+                                        )
+                                        asyncio.create_task(send_discord(acc_msg))
 
                         # Phantom alert handling (is_phantom was already calculated earlier before range updates)
                         if is_phantom:
@@ -1697,6 +1927,7 @@ async def run():
                         is_darkpool = (exch == 4)  # Exchange 4 is dark pool
                         if is_darkpool and size >= DARK_POOL_SIZE_THRESHOLD and not bad_conditions:
                             # Log to tracker for end-of-day summary (ALWAYS logged individually!)
+                            # Returns complete trade_record with calculated notional
                             dp_trade_data = {
                                 'price': price,
                                 'size': size,
@@ -1705,7 +1936,7 @@ async def run():
                                 'sip_timestamp': sip_ts_raw,
                                 'trf_timestamp': trf_ts_raw
                             }
-                            dark_pool_tracker.log_dark_pool_print(dp_trade_data)
+                            complete_record = dark_pool_tracker.log_dark_pool_print(dp_trade_data)
                             
                             # Print to console
                             print(
@@ -1715,9 +1946,8 @@ async def run():
                             )
                             
                             # Queue for smart batched Discord alert
-                            # If multiple prints at same price come quickly, they'll batch
-                            # If single print, sends after 3-second delay with full details
-                            asyncio.create_task(dark_pool_tracker.queue_for_alert(dp_trade_data))
+                            # Use complete_record which has notional calculated
+                            asyncio.create_task(dark_pool_tracker.queue_for_alert(complete_record))
                         
                         # RTH breakout logic
                         if in_rth and not bad_conditions:
