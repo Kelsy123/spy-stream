@@ -1116,7 +1116,7 @@ def detect_exhaustion(windows):
         return False, None
     
     # Calculate average volume of previous 3 windows
-    prev_volumes = [w.get_metrics()['total_volume'] for w in windows[-4:-1]]
+    prev_volumes = [w.get_metrics()['total_volume'] for w in list(windows)[-4:-1]]
     avg_prev_volume = sum(prev_volumes) / len(prev_volumes)
     
     if avg_prev_volume == 0:
