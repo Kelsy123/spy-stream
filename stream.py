@@ -1433,9 +1433,128 @@ async def init_postgres():
     return conn
 
 # ======================================================
+# QCT TRACKER — Conditions [53, 52, 41] Volume Monitor
+# Tracks volume % of institutional multi-leg (QCT) trades vs total daily volume
+# Reports at 3:30 PM ET (intraday check) and 8:01 PM ET (end-of-day summary)
+# ======================================================
+class QCTTracker:
+    """
+    Tracks trades with conditions [53, 52, 41] (Qualified Contingent Trade + Contingent + Trade-Thru-Exempt).
+    These are institutional multi-leg hedging/unwinding structures.
+    Accumulates volume in-memory and reports % of total daily volume at scheduled times.
+    """
+    TARGET_CONDITIONS = frozenset([41, 52, 53])
+
+    def __init__(self, ticker="SPY"):
+        self.ticker = ticker
+        self.total_volume = 0
+        self.qct_volume = 0
+        self.total_trades = 0
+        self.qct_trades = 0
+        self.session_date = datetime.now(ET).date()
+        print("✅ QCT tracker ENABLED — monitoring conditions [53, 52, 41]", flush=True)
+
+    def record_trade(self, size: int, conds: list):
+        """Call this for every trade event."""
+        # Reset if date rolled over
+        today = datetime.now(ET).date()
+        if today != self.session_date:
+            self.reset()
+            self.session_date = today
+
+        self.total_volume += size
+        self.total_trades += 1
+
+        if frozenset(conds) == self.TARGET_CONDITIONS:
+            self.qct_volume += size
+            self.qct_trades += 1
+
+    def reset(self):
+        self.total_volume = 0
+        self.qct_volume = 0
+        self.total_trades = 0
+        self.qct_trades = 0
+
+    def get_pct(self) -> float:
+        """Return QCT volume as % of total daily volume."""
+        if self.total_volume == 0:
+            return 0.0
+        return round((self.qct_volume / self.total_volume) * 100, 4)
+
+    def build_report(self, label: str) -> str:
+        pct = self.get_pct()
+        now_str = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+
+        # Contextual flag based on historically elevated levels
+        if pct >= 5.0:
+            flag = "🚨 **ELEVATED** — historically preceded sharp sell-offs (e.g., 02-02: 5.33%, 02-10: 5.39%)"
+        elif pct >= 3.5:
+            flag = "⚠️ **NOTEWORTHY** — above average institutional hedging/unwinding activity"
+        elif pct >= 2.0:
+            flag = "📊 **MODERATE** — within normal range, worth watching"
+        else:
+            flag = "✅ **LOW** — no unusual QCT activity"
+
+        return (
+            f"{'🔔' if 'Intraday' in label else '📋'} **QCT Report — {label}**\n"
+            f"Symbol: **{self.ticker}** | Time: {now_str}\n"
+            f"─────────────────────────────\n"
+            f"QCT Volume `[53, 52, 41]`: **{self.qct_volume:,}** shares\n"
+            f"Total Daily Volume: **{self.total_volume:,}** shares\n"
+            f"**QCT % of Total Volume: {pct:.4f}%**\n"
+            f"QCT Trade Count: {self.qct_trades:,} | Total Trades: {self.total_trades:,}\n"
+            f"─────────────────────────────\n"
+            f"{flag}"
+        )
+
+
+async def run_qct_scheduler(qct_tracker):
+    """
+    Separate coroutine — runs alongside the main websocket loop via asyncio.gather.
+    Sleeps until 3:30 PM ET (intraday check) then 8:01 PM ET (end-of-day report).
+    Resets flags for the new day automatically.
+    """
+    reported_330 = False
+    reported_eod = False
+    last_report_date = None
+
+    print("🕐 QCT scheduler started — will report at 3:30 PM and 8:01 PM ET", flush=True)
+
+    while True:
+        now_et = datetime.now(ET)
+        today = now_et.date()
+
+        # Reset flags on new trading day
+        if last_report_date is not None and today > last_report_date:
+            reported_330 = False
+            reported_eod = False
+
+        t = now_et.time()
+
+        # 3:30 PM intraday report
+        if not reported_330 and t >= time(15, 30) and t < time(20, 1):
+            report = qct_tracker.build_report("Intraday 3:30 PM Check")
+            print(f"\n{report}\n", flush=True)
+            await send_discord(report)
+            reported_330 = True
+            last_report_date = today
+
+        # 8:01 PM end-of-day report
+        if not reported_eod and t >= time(20, 1):
+            report = qct_tracker.build_report("End-of-Day Summary")
+            print(f"\n{report}\n", flush=True)
+            await send_discord(report)
+            reported_eod = True
+            last_report_date = today
+
+        # Sleep 30 seconds between checks — lightweight
+        await asyncio.sleep(30)
+
+
+# ======================================================
 # MAIN
 # ======================================================
-async def run():
+async def run(shared=None):
     # Check for manual override first
     if MANUAL_PREV_LOW is not None and MANUAL_PREV_HIGH is not None:
         prev_low = MANUAL_PREV_LOW
@@ -1472,7 +1591,12 @@ async def run():
     # Initialize phantom print tracker
     phantom_tracker = PhantomPrintTracker(SYMBOL)
     print("✅ Phantom print tracker ENABLED", flush=True)
-    
+
+    # Initialize QCT tracker
+    qct_tracker = QCTTracker(SYMBOL)
+    if shared is not None:
+        shared["qct_tracker"] = qct_tracker
+
     # Session ranges
     today_low = None
     today_high = None
@@ -1549,6 +1673,9 @@ async def run():
 
                         if LOG_ALL_TRADES:
                             print(f"TRADE {price} size={size} cond={conds} exch={exch}")
+
+                        # QCT volume tracking — record every trade (all sessions, all sizes)
+                        qct_tracker.record_trade(size, conds)
 
                         tm = datetime.fromtimestamp(sip_ts_raw/1000, tz=ET).time()
 
@@ -1991,6 +2118,25 @@ async def run():
 
 if __name__ == "__main__":
     import signal
+
+    # We need qct_tracker accessible to both run() and the scheduler.
+    # The cleanest approach: run() returns qct_tracker via a shared container,
+    # but since run() is an infinite loop, we use a shared mutable dict instead.
+    _shared = {}
+
+    async def main():
+        # run() now yields qct_tracker via _shared before entering its loop
+        # We launch both coroutines; scheduler waits for qct_tracker to be ready
+        await asyncio.gather(
+            run(_shared),
+            _run_scheduler_when_ready(_shared),
+        )
+
+    async def _run_scheduler_when_ready(shared):
+        # Wait until run() has initialized qct_tracker
+        while "qct_tracker" not in shared:
+            await asyncio.sleep(0.5)
+        await run_qct_scheduler(shared["qct_tracker"])
     
     # Global references for signal handler
     global_zero_logger = None
@@ -2032,7 +2178,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, signal_handler)
     
     try:
-        asyncio.run(run())
+        asyncio.run(main())
     except Exception as e:
         import traceback
         print("❌ Fatal crash:", e, flush=True)
