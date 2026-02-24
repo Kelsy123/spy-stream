@@ -142,10 +142,17 @@ class ZeroSizeTradeLogger:
         # In-memory storage for session
         self.zero_trades = []
 
-        # 5-second batching buffer for Discord alerts
-        self._batch_buffer = []        # trades collected in current window
-        self._batch_task = None        # asyncio task handle
-        self._batch_window = 10.0      # seconds to collect before sending remainder
+        # --- Structural alert buffer (conditions beyond just [37]) ---
+        # First trade fires immediately, remainder batch in 10s window
+        self._batch_buffer = []
+        self._batch_task = None
+        self._batch_window = 10.0
+
+        # --- [37]-only silent accumulator ---
+        # Never pings Discord individually — flushed hourly as a single summary line
+        self._trf_buffer = []                          # [37]-only trades since last hourly flush
+        self._last_hourly_flush = time_module.time()   # when we last sent the hourly summary
+        self._hourly_interval = 3600.0                 # 1 hour in seconds
 
         # Console log batching — flush every 30 seconds to reduce Railway log volume
         self._console_buffer = []
@@ -185,46 +192,48 @@ class ZeroSizeTradeLogger:
                     'TRF_ID'
                 ])
     
+    @staticmethod
+    def _is_trf_only(conditions: list) -> bool:
+        """Returns True if the only condition is [37] — pure TRF reporting artifact."""
+        return set(conditions) == {37}
+
     def queue_discord_alert(self, trade_record):
         """
-        First trade in a burst: send immediately to Discord.
-        Subsequent trades within 10 seconds: batch and send as one grouped message.
+        Route by condition:
+        - [37] only  -> silent TRF accumulator, flushed hourly (no pings)
+        - anything else -> immediate first alert + 10s batch remainder
         """
+        if self._is_trf_only(trade_record['conditions']):
+            self._trf_buffer.append(trade_record)
+            return
+
         is_first = self._batch_task is None or self._batch_task.done()
         self._batch_buffer.append(trade_record)
-
         if is_first:
-            # Send the first trade immediately as a single alert
             asyncio.create_task(self._send_first_alert(trade_record))
-            # Start 10-second window to collect and batch the rest
             self._batch_task = asyncio.create_task(self._flush_after_window())
-        # else: already collecting — trade is in buffer, will flush with the rest
 
     async def _send_first_alert(self, record):
-        """Send the very first trade in a burst immediately."""
+        """Immediate alert for first structural (non-[37]) trade in a burst."""
         now_str = datetime.now(ET).strftime("%H:%M:%S ET")
         exch = record['exchange_name'][:21]
         conds_str = '|'.join(str(c) for c in record['conditions']) if record['conditions'] else '-'
         msg = (
-            f"🔍 **Zero-Size Trade** ({now_str})\n"
+            f"\U0001f50d **Zero-Size Trade** ({now_str})\n"
             f"`{record['time_est']}  ${record['price']:.2f}  {exch}  seq={record['sequence']}  conds={conds_str}`"
         )
         await send_discord_zero(msg)
 
     async def _flush_after_window(self):
-        """Wait 10 seconds, then send one batched message for all buffered trades after the first."""
+        """10s after first alert, send one batched table for all remaining structural trades."""
         await asyncio.sleep(self._batch_window)
-
-        # Skip the first record — it was already sent immediately
         remaining = list(self._batch_buffer[1:])
         self._batch_buffer.clear()
-
         if not remaining:
             return
-
         count = len(remaining)
         now_str = datetime.now(ET).strftime("%H:%M:%S ET")
-        lines = [f"🔍 **+{count} more zero-size trades in window** ({now_str})"]
+        lines = [f"\U0001f50d **+{count} more zero-size trades in window** ({now_str})"]
         lines.append("```")
         lines.append(f"{'#':<4} {'Time':<12} {'Price':<9} {'Exchange':<22} {'Conds'}")
         lines.append("-" * 65)
@@ -234,6 +243,30 @@ class ZeroSizeTradeLogger:
             lines.append(f"{i:<4} {t['time_est']:<12} ${t['price']:<8.2f} {exch:<22} {conds_str}")
         lines.append("```")
         await send_discord_zero("\n".join(lines))
+
+    async def flush_trf_hourly(self):
+        """
+        Send one compact hourly summary of [37]-only trades. No individual pings.
+        Call from the main loop on every trade — internally rate-limited to 1/hour.
+        """
+        now = time_module.time()
+        if now - self._last_hourly_flush < self._hourly_interval:
+            return
+        if not self._trf_buffer:
+            self._last_hourly_flush = now
+            return
+        batch = list(self._trf_buffer)
+        self._trf_buffer.clear()
+        self._last_hourly_flush = now
+        count = len(batch)
+        prices = [t['price'] for t in batch]
+        lo, hi, avg = min(prices), max(prices), sum(prices) / count
+        now_str = datetime.now(ET).strftime("%H:%M:%S ET")
+        msg = (
+            f"\U0001f50d **[37]-Only Zero-Size Hourly Summary** ({now_str})\n"
+            f"`{count:,} prints  |  ${lo:.2f} – ${hi:.2f}  |  avg ${avg:.2f}`"
+        )
+        await send_discord_zero(msg)
 
     def log_zero_trade(self, trade_data):
         """
@@ -1919,6 +1952,9 @@ async def run(shared=None):
 
                             # Flush console buffer every 30s to keep Railway logs manageable
                             zero_logger.flush_console_buffer()
+
+                            # Flush [37]-only TRF summary to Discord once per hour
+                            asyncio.create_task(zero_logger.flush_trf_hourly())
 
                         # Update session-specific categories FIRST (needed for categorization)
                         in_premarket = time(4, 0) <= tm < time(9, 30)
