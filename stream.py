@@ -21,6 +21,7 @@ WS_URL = "wss://socket.massive.com/stocks"
 MASSIVE_API_KEY = os.environ["MASSIVE_API_KEY"]
 POSTGRES_URL = os.environ["POSTGRES_URL"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
+DISCORD_ZERO_WEBHOOK_URL = os.environ["DISCORD_ZERO_WEBHOOK_URL"]  # Separate channel for zero-size trade alerts
 TRADIER_API_KEY = os.environ["TRADIER_API_KEY"]
 
 # Manual previous day range override (set in Railway environment variables)
@@ -113,6 +114,14 @@ async def send_discord(msg: str):
     except Exception as e:
         print(f"⚠️ Discord webhook failed: {e}", flush=True)
 
+async def send_discord_zero(msg: str):
+    """Send to the dedicated zero-size trade Discord channel (DISCORD_ZERO_WEBHOOK_URL)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.post(DISCORD_ZERO_WEBHOOK_URL, json={"content": msg})
+    except Exception as e:
+        print(f"⚠️ Discord zero-size webhook failed: {e}", flush=True)
+
 # ======================================================
 # ZERO-SIZE TRADE LOGGER
 # ======================================================
@@ -120,6 +129,7 @@ class ZeroSizeTradeLogger:
     """
     Logs all zero-size trades for analysis
     Creates daily CSV and JSON files for pattern recognition
+    Discord alerts are batched into 5-second windows to prevent rate limiting
     """
     def __init__(self, ticker="SPY"):
         self.ticker = ticker
@@ -131,6 +141,15 @@ class ZeroSizeTradeLogger:
         
         # In-memory storage for session
         self.zero_trades = []
+
+        # 5-second batching buffer for Discord alerts
+        self._batch_buffer = []        # trades collected in current window
+        self._batch_task = None        # asyncio task handle
+        self._batch_window = 10.0      # seconds to collect before sending remainder
+
+        # Console log batching — flush every 30 seconds to reduce Railway log volume
+        self._console_buffer = []
+        self._last_console_flush = time_module.time()
         
         print(f"📊 Zero-size logger initialized. Logs: {self.log_dir}", flush=True)
     
@@ -166,15 +185,62 @@ class ZeroSizeTradeLogger:
                     'TRF_ID'
                 ])
     
+    def queue_discord_alert(self, trade_record):
+        """
+        First trade in a burst: send immediately to Discord.
+        Subsequent trades within 10 seconds: batch and send as one grouped message.
+        """
+        is_first = self._batch_task is None or self._batch_task.done()
+        self._batch_buffer.append(trade_record)
+
+        if is_first:
+            # Send the first trade immediately as a single alert
+            asyncio.create_task(self._send_first_alert(trade_record))
+            # Start 10-second window to collect and batch the rest
+            self._batch_task = asyncio.create_task(self._flush_after_window())
+        # else: already collecting — trade is in buffer, will flush with the rest
+
+    async def _send_first_alert(self, record):
+        """Send the very first trade in a burst immediately."""
+        now_str = datetime.now(ET).strftime("%H:%M:%S ET")
+        exch = record['exchange_name'][:21]
+        conds_str = '|'.join(str(c) for c in record['conditions']) if record['conditions'] else '-'
+        msg = (
+            f"🔍 **Zero-Size Trade** ({now_str})\n"
+            f"`{record['time_est']}  {exch}  seq={record['sequence']}  conds={conds_str}`"
+        )
+        await send_discord_zero(msg)
+
+    async def _flush_after_window(self):
+        """Wait 10 seconds, then send one batched message for all buffered trades after the first."""
+        await asyncio.sleep(self._batch_window)
+
+        # Skip the first record — it was already sent immediately
+        remaining = list(self._batch_buffer[1:])
+        self._batch_buffer.clear()
+
+        if not remaining:
+            return
+
+        count = len(remaining)
+        now_str = datetime.now(ET).strftime("%H:%M:%S ET")
+        lines = [f"🔍 **+{count} more zero-size trades in window** ({now_str})"]
+        lines.append("```")
+        lines.append(f"{'#':<4} {'Time':<12} {'Exchange':<22} {'Seq':<10} {'Conds'}")
+        lines.append("-" * 65)
+        for i, t in enumerate(remaining, 1):
+            exch = t['exchange_name'][:21]
+            conds_str = '|'.join(str(c) for c in t['conditions']) if t['conditions'] else '-'
+            lines.append(f"{i:<4} {t['time_est']:<12} {exch:<22} {str(t['sequence']):<10} {conds_str}")
+        lines.append("```")
+        await send_discord_zero("\n".join(lines))
+
     def log_zero_trade(self, trade_data):
         """
-        Log a zero-size trade to both CSV and JSON
-        Also print to console for real-time monitoring
-        
-        Args:
-            trade_data: Dictionary with Massive.com trade fields
+        Log a zero-size trade to CSV, JSON, and in-memory list.
+        Console output is batched — prints a summary line per trade,
+        with a periodic flush to avoid flooding Railway logs.
         """
-        # Extract Massive.com specific fields
         timestamp_ms = trade_data.get('sip_timestamp', 0)
         timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=ET)
         
@@ -202,8 +268,8 @@ class ZeroSizeTradeLogger:
         # Write to JSON (append to array)
         self.write_to_json(trade_record)
         
-        # Print to console
-        self.print_zero_trade(trade_record)
+        # Buffer for console — flush every 30 seconds instead of printing every trade
+        self._console_buffer.append(trade_record)
         
         return trade_record
     
@@ -248,18 +314,28 @@ class ZeroSizeTradeLogger:
         with open(json_file, 'w') as f:
             json.dump(data, f, indent=2)
     
-    def print_zero_trade(self, record):
-        """Print zero-size trade to console with formatting"""
-        print(f"\n{'='*80}", flush=True)
-        print(f"🔍 ZERO-SIZE TRADE DETECTED - {self.ticker}", flush=True)
-        print(f"{'='*80}", flush=True)
-        print(f"Time:       {record['time_est']}", flush=True)
-        print(f"Price:      ${record['price']:.2f}", flush=True)
-        print(f"Exchange:   {record['exchange_name']} ({record['exchange']})", flush=True)
-        print(f"Conditions: {', '.join(str(c) for c in record['conditions']) if record['conditions'] else 'None'}", flush=True)
-        print(f"Sequence:   {record['sequence']}", flush=True)
-        print(f"TRF ID:     {record['trf_id']}", flush=True)
-        print(f"{'='*80}\n", flush=True)
+    def flush_console_buffer(self):
+        """
+        Print a compact summary of buffered zero-size trades to Railway logs.
+        Called every 30 seconds from the main loop — one line per trade instead
+        of the old multi-line block, dramatically reducing log volume.
+        """
+        if not self._console_buffer:
+            return
+        now = time_module.time()
+        if now - self._last_console_flush < 30:
+            return  # Not time yet
+
+        batch = list(self._console_buffer)
+        self._console_buffer.clear()
+        self._last_console_flush = now
+
+        count = len(batch)
+        now_str = datetime.now(ET).strftime("%H:%M:%S ET")
+        print(f"\n🔍 Zero-size trades logged ({count} in last 30s) — {now_str}", flush=True)
+        for t in batch:
+            conds_str = '|'.join(str(c) for c in t['conditions']) if t['conditions'] else '-'
+            print(f"   {t['time_est']}  ${t['price']:.2f}  seq={t['sequence']}  conds={conds_str}", flush=True)
     
     def get_exchange_name(self, code):
         """Convert exchange code to readable name"""
@@ -351,8 +427,43 @@ JSON: {self.get_json_file()}
             return "  None"
         return '\n'.join(f"  {prefix}{k}: {v}" for k, v in sorted(d.items(), key=lambda x: x[1], reverse=True))
     
+    async def send_csv_to_discord(self):
+        """Upload today's CSV file as a Discord attachment to the zero-size channel."""
+        csv_file = self.get_csv_file()
+        if not csv_file.exists():
+            await send_discord_zero("📎 Zero-size CSV not found — no trades were written today.")
+            return
+
+        try:
+            with open(csv_file, 'rb') as f:
+                csv_bytes = f.read()
+
+            filename = csv_file.name
+            form = aiohttp.FormData()
+            form.add_field(
+                'payload_json',
+                json.dumps({"content": f"📎 **Zero-Size Trade Log — {self.ticker} {self.get_today_str()}**"}),
+                content_type='application/json'
+            )
+            form.add_field(
+                'file',
+                csv_bytes,
+                filename=filename,
+                content_type='text/csv'
+            )
+
+            async with aiohttp.ClientSession() as session:
+                resp = await session.post(DISCORD_ZERO_WEBHOOK_URL, data=form)
+                if resp.status in (200, 204):
+                    print(f"📎 Zero-size CSV uploaded to Discord zero channel: {filename}", flush=True)
+                else:
+                    text = await resp.text()
+                    print(f"⚠️ CSV Discord upload failed ({resp.status}): {text}", flush=True)
+        except Exception as e:
+            print(f"⚠️ CSV Discord upload error: {e}", flush=True)
+
     async def save_summary(self):
-        """Save daily summary to file and send to Discord"""
+        """Save daily summary to file, send text summary + CSV attachment to Discord"""
         summary = self.get_daily_summary()
         summary_file = self.log_dir / f"summary_{self.ticker}_{self.get_today_str()}.txt"
         with open(summary_file, 'w') as f:
@@ -387,7 +498,10 @@ JSON: {self.get_json_file()}
                 discord_msg += f"{i:<4} {trade['time_est']:<12} ${trade['price']:<9.2f} {exch_name:<15}\n"
             
             discord_msg += "```"
-            await send_discord(discord_msg)
+            await send_discord_zero(discord_msg)
+
+            # Upload the CSV as a file attachment
+            await self.send_csv_to_discord()
         
         return summary_file
 
@@ -1475,15 +1589,22 @@ class QCTTracker:
         self.total_trades = 0
         self.qct_trades = 0
 
-    def get_pct(self) -> float:
-        """Return QCT volume as % of total daily volume."""
-        if self.total_volume == 0:
+    def get_pct(self, override_total=None) -> float:
+        """Return QCT volume as % of total daily volume. Optional override for official API volume."""
+        total = override_total if override_total is not None else self.total_volume
+        if total == 0:
             return 0.0
-        return round((self.qct_volume / self.total_volume) * 100, 4)
+        return round((self.qct_volume / total) * 100, 4)
 
-    def build_report(self, label: str) -> str:
-        pct = self.get_pct()
+    def build_report(self, label: str, official_volume: int = None) -> str:
+        pct = self.get_pct(override_total=official_volume)
         now_str = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+
+        # Volume display — show official if available, streamed as fallback with note
+        if official_volume is not None:
+            volume_line = f"Total Daily Volume: **{official_volume:,}** shares *(official API)*"
+        else:
+            volume_line = f"Total Daily Volume: **{self.total_volume:,}** shares *(streamed — may be incomplete)*"
 
         # Contextual flag based on historically elevated levels
         if pct >= 5.0:
@@ -1500,7 +1621,7 @@ class QCTTracker:
             f"Symbol: **{self.ticker}** | Time: {now_str}\n"
             f"─────────────────────────────\n"
             f"QCT Volume `[53, 52, 41]`: **{self.qct_volume:,}** shares\n"
-            f"Total Daily Volume: **{self.total_volume:,}** shares\n"
+            f"{volume_line}\n"
             f"**QCT % of Total Volume: {pct:.4f}%**\n"
             f"QCT Trade Count: {self.qct_trades:,} | Total Trades: {self.total_trades:,}\n"
             f"─────────────────────────────\n"
@@ -1508,17 +1629,55 @@ class QCTTracker:
         )
 
 
+async def fetch_official_daily_volume(symbol: str, api_key: str) -> int | None:
+    """
+    Fetch today's official total volume from Massive REST API.
+    Uses the daily aggregates endpoint — same auth pattern as fetch_prev_day_range_massive.
+    Returns volume as int, or None if the call fails.
+    """
+    try:
+        today = datetime.now(ET).date()
+        # Range endpoint: use today as both start and end to get just today's bar
+        url = (
+            f"https://api.massive.io/v1/stocks/aggregates/{symbol}/range/1/day/"
+            f"{today.isoformat()}/{today.isoformat()}"
+        )
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    print(f"⚠️ Massive volume API returned {r.status}", flush=True)
+                    return None
+                data = await r.json()
+
+        results = data.get("results", [])
+        if not results:
+            print("⚠️ Massive volume API returned no results for today", flush=True)
+            return None
+
+        # Last result is today's bar — field 'v' is volume
+        vol = int(results[-1].get("v", 0))
+        print(f"✅ Official daily volume from Massive: {vol:,}", flush=True)
+        return vol if vol > 0 else None
+
+    except Exception as e:
+        print(f"⚠️ fetch_official_daily_volume error: {e}", flush=True)
+        return None
+
+
 async def run_qct_scheduler(qct_tracker):
     """
     Separate coroutine — runs alongside the main websocket loop via asyncio.gather.
-    Sleeps until 3:30 PM ET (intraday check) then 8:01 PM ET (end-of-day report).
+    3:30 PM ET: intraday check using streamed volume.
+    8:05 PM ET: EOD report using official Massive API volume (gives API time to finalize).
     Resets flags for the new day automatically.
     """
     reported_330 = False
     reported_eod = False
     last_report_date = None
 
-    print("🕐 QCT scheduler started — will report at 3:30 PM and 8:01 PM ET", flush=True)
+    print("🕐 QCT scheduler started — will report at 3:30 PM and 8:05 PM ET", flush=True)
 
     while True:
         now_et = datetime.now(ET)
@@ -1531,17 +1690,19 @@ async def run_qct_scheduler(qct_tracker):
 
         t = now_et.time()
 
-        # 3:30 PM intraday report
-        if not reported_330 and t >= time(15, 30) and t < time(20, 1):
+        # 3:30 PM intraday report — streamed volume is fine here, market still open
+        if not reported_330 and t >= time(15, 30) and t < time(20, 5):
             report = qct_tracker.build_report("Intraday 3:30 PM Check")
             print(f"\n{report}\n", flush=True)
             await send_discord(report)
             reported_330 = True
             last_report_date = today
 
-        # 8:01 PM end-of-day report
-        if not reported_eod and t >= time(20, 1):
-            report = qct_tracker.build_report("End-of-Day Summary")
+        # 8:05 PM EOD report — fetch official volume from Massive API
+        if not reported_eod and t >= time(20, 5):
+            print("📊 Fetching official daily volume for QCT EOD report...", flush=True)
+            official_vol = await fetch_official_daily_volume(SYMBOL, MASSIVE_API_KEY)
+            report = qct_tracker.build_report("End-of-Day Summary", official_volume=official_vol)
             print(f"\n{report}\n", flush=True)
             await send_discord(report)
             reported_eod = True
@@ -1732,20 +1893,13 @@ async def run(shared=None):
                                 'trf_timestamp': trf_ts_raw,
                                 'trf_id': trf_id
                             }
-                            zero_logger.log_zero_trade(zero_trade_data)
-                            
-                            # Send immediate Discord alert
-                            exchange_name = zero_logger.get_exchange_name(exch)
-                            zero_msg = (
-                                f"🔍 **Zero-Size Trade Detected**\n"
-                                f"Price: **${price}**\n"
-                                f"Exchange: {exchange_name} ({exch})\n"
-                                f"Conditions: {conds}\n"
-                                f"SIP Time: {datetime.fromtimestamp(sip_ts_raw/1000, tz=ET)}\n"
-                                f"Sequence: {sequence}\n"
-                                f"TRF ID: {trf_id}"
-                            )
-                            asyncio.create_task(send_discord(zero_msg))
+                            trade_record = zero_logger.log_zero_trade(zero_trade_data)
+
+                            # Queue for batched Discord alert (first fires immediately, rest batch in 10s)
+                            zero_logger.queue_discord_alert(trade_record)
+
+                            # Flush console buffer every 30s to keep Railway logs manageable
+                            zero_logger.flush_console_buffer()
 
                         # Update session-specific categories FIRST (needed for categorization)
                         in_premarket = time(4, 0) <= tm < time(9, 30)
