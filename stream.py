@@ -1419,7 +1419,7 @@ def fetch_prev_day_range_massive(symbol, massive_api_key):
         end_date = date.today()
         start_date = end_date - timedelta(days=5)
         
-        url = f"https://api.massive.io/v1/stocks/aggregates/{symbol}/range/1/day/{start_date.isoformat()}/{end_date.isoformat()}"
+        url = f"https://api.massive.com/v1/stocks/aggregates/{symbol}/range/1/day/{start_date.isoformat()}/{end_date.isoformat()}"
         headers = {"Authorization": f"Bearer {massive_api_key}"}
         
         r = requests.get(url, headers=headers, timeout=10)
@@ -1470,7 +1470,7 @@ async def is_market_holiday():
 
     # Check Massive upcoming market status for holidays
     try:
-        url = "https://api.massive.io/v1/marketstatus/upcoming"
+        url = "https://api.massive.com/v1/marketstatus/upcoming"
         headers = {"Authorization": f"Bearer {MASSIVE_API_KEY}"}
 
         loop = asyncio.get_event_loop()
@@ -1656,7 +1656,7 @@ async def fetch_official_daily_volume(symbol: str, api_key: str) -> int | None:
     """
     try:
         today = datetime.now(ET).date()
-        url = f"https://api.massive.io/v1/open-close/{symbol}/{today.isoformat()}"
+        url = f"https://api.massive.com/v1/open-close/{symbol}/{today.isoformat()}"
         headers = {"Authorization": f"Bearer {api_key}"}
 
         loop = asyncio.get_event_loop()
