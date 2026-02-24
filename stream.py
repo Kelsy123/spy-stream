@@ -1457,44 +1457,59 @@ def fetch_prev_day_range_massive(symbol, massive_api_key):
 # ======================================================
 async def is_market_holiday():
     """
-    Check if today is a market holiday or weekend
-    Uses Massive.com market holidays API
-    Returns: True if market is closed (holiday/weekend), False if open
+    Check if today is a market holiday or weekend.
+    Uses /v1/marketstatus/upcoming endpoint — checks if today appears as a closed day.
+    Returns: True if market is closed (holiday/weekend), False if open.
     """
     today = datetime.now(ET).date()
-    
-    # Check if weekend
+
+    # Weekend check first — no API call needed
     if today.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
         print(f"📅 {today} is a weekend - market closed", flush=True)
         return True
-    
-    # Check Massive.com API for market holidays
+
+    # Check Massive upcoming market status for holidays
     try:
-        url = f"https://api.massive.io/v1/reference/market-holidays/{today.year}"
+        url = "https://api.massive.io/v1/marketstatus/upcoming"
         headers = {"Authorization": f"Bearer {MASSIVE_API_KEY}"}
-        
+
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    holidays = data.get('holidays', [])
-                    
-                    # Check if today matches any holiday
-                    today_str = today.strftime('%Y-%m-%d')
-                    for holiday in holidays:
-                        holiday_date = holiday.get('date', '')
-                        if holiday_date == today_str:
-                            holiday_name = holiday.get('name', 'Market Holiday')
-                            print(f"📅 {today} is {holiday_name} - market closed", flush=True)
-                            return True
-                    
-                    print(f"📅 {today} is a trading day - market open", flush=True)
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status != 200:
+                    print(f"⚠️ Market status API returned {response.status}, assuming market open", flush=True)
                     return False
-                else:
-                    print(f"⚠️ Could not check market holidays (API returned {response.status}), assuming market is open", flush=True)
-                    return False
+                data = await response.json()
+
+        # Log raw response once for debugging field names
+        print(f"📅 Market status response: {str(data)[:300]}", flush=True)
+
+        # The endpoint returns a list of upcoming market status entries.
+        # Each entry expected to have a date field and a status/open field.
+        # Mark as holiday if today's date appears with a closed/holiday status.
+        today_str = today.strftime("%Y-%m-%d")
+
+        entries = data if isinstance(data, list) else data.get("results", data.get("data", []))
+        for entry in entries:
+            # Try common field name patterns
+            entry_date = entry.get("date", entry.get("day", ""))
+            if not entry_date.startswith(today_str):
+                continue
+            # Check if this entry indicates market is closed
+            is_open = entry.get("open", entry.get("isOpen", entry.get("status", "open")))
+            if is_open is False or str(is_open).lower() in ("false", "closed", "holiday", "0"):
+                name = entry.get("name", entry.get("description", "Market Holiday"))
+                print(f"📅 {today} is {name} - market closed", flush=True)
+                return True
+            else:
+                print(f"📅 {today} is a trading day - market open", flush=True)
+                return False
+
+        # Today not found in upcoming — means it's a normal trading day
+        print(f"📅 {today} not in closed dates — market open", flush=True)
+        return False
+
     except Exception as e:
-        print(f"⚠️ Error checking market holidays: {e}, assuming market is open", flush=True)
+        print(f"⚠️ Error checking market status: {e}, assuming market open", flush=True)
         return False
 
 # ======================================================
@@ -1632,34 +1647,30 @@ class QCTTracker:
 async def fetch_official_daily_volume(symbol: str, api_key: str) -> int | None:
     """
     Fetch today's official total volume from Massive REST API.
-    Uses the daily aggregates endpoint — same auth pattern as fetch_prev_day_range_massive.
+    Uses the open-close endpoint: /v1/open-close/{symbol}/{date}
     Returns volume as int, or None if the call fails.
     """
     try:
         today = datetime.now(ET).date()
-        # Range endpoint: use today as both start and end to get just today's bar
-        url = (
-            f"https://api.massive.io/v1/stocks/aggregates/{symbol}/range/1/day/"
-            f"{today.isoformat()}/{today.isoformat()}"
-        )
+        url = f"https://api.massive.io/v1/open-close/{symbol}/{today.isoformat()}"
         headers = {"Authorization": f"Bearer {api_key}"}
 
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status != 200:
-                    print(f"⚠️ Massive volume API returned {r.status}", flush=True)
+                    text = await r.text()
+                    print(f"⚠️ Massive open-close API returned {r.status}: {text[:100]}", flush=True)
                     return None
                 data = await r.json()
 
-        results = data.get("results", [])
-        if not results:
-            print("⚠️ Massive volume API returned no results for today", flush=True)
+        # Response field for volume — log full response once so we can verify field name
+        print(f"✅ Massive open-close response: {data}", flush=True)
+        vol = int(data.get("volume", data.get("v", 0)))
+        if vol == 0:
+            print("⚠️ Volume field was 0 or missing in open-close response", flush=True)
             return None
-
-        # Last result is today's bar — field 'v' is volume
-        vol = int(results[-1].get("v", 0))
         print(f"✅ Official daily volume from Massive: {vol:,}", flush=True)
-        return vol if vol > 0 else None
+        return vol
 
     except Exception as e:
         print(f"⚠️ fetch_official_daily_volume error: {e}", flush=True)
