@@ -1133,12 +1133,19 @@ class VelocityWindow:
             self.highest_price = price
         if self.lowest_price is None or price < self.lowest_price:
             self.lowest_price = price
-            
-        # Check if this window made new session high/low
-        if price >= session_high:
-            self.made_new_high = True
-        if price <= session_low:
-            self.made_new_low = True
+
+    def mark_extremes(self, prev_window_high, prev_window_low):
+        """
+        Called once a window is complete, comparing against the PREVIOUS window's
+        range — not the session absolute. This ensures exhaustion/divergence alerts
+        fire relative to recent price action, not a morning spike/flush from hours ago.
+        """
+        if self.highest_price is not None and prev_window_high is not None:
+            if self.highest_price > prev_window_high:
+                self.made_new_high = True
+        if self.lowest_price is not None and prev_window_low is not None:
+            if self.lowest_price < prev_window_low:
+                self.made_new_low = True
     
     def is_complete(self, current_time):
         """Check if this window is finished"""
@@ -2048,16 +2055,18 @@ async def run(shared=None):
                             if current_velocity_window is None:
                                 current_velocity_window = VelocityWindow(current_time)
                             elif current_velocity_window.is_complete(current_time):
-                                # Window is complete, archive it and start new one
+                                # Mark extremes relative to the previous window before archiving
+                                if velocity_windows:
+                                    prev = velocity_windows[-1]
+                                    current_velocity_window.mark_extremes(
+                                        prev.highest_price, prev.lowest_price
+                                    )
+                                # Archive completed window and start new one
                                 velocity_windows.append(current_velocity_window)
                                 current_velocity_window = VelocityWindow(current_time)
                             
-                            # Add trade to current window
-                            current_velocity_window.add_trade(
-                                price, size,
-                                today_high if today_high else price,
-                                today_low if today_low else price
-                            )
+                            # Add trade to current window (no session high/low needed anymore)
+                            current_velocity_window.add_trade(price, size, None, None)
                             
                             # Check for divergence when window completes
                             if len(velocity_windows) >= VELOCITY_CONFIRMATION_WINDOWS + 1:
