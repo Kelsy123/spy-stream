@@ -207,7 +207,7 @@ class ZeroSizeTradeLogger:
         conds_str = '|'.join(str(c) for c in record['conditions']) if record['conditions'] else '-'
         msg = (
             f"🔍 **Zero-Size Trade** ({now_str})\n"
-            f"`{record['time_est']}  {exch}  seq={record['sequence']}  conds={conds_str}`"
+            f"`{record['time_est']}  ${record['price']:.2f}  {exch}  seq={record['sequence']}  conds={conds_str}`"
         )
         await send_discord_zero(msg)
 
@@ -226,12 +226,12 @@ class ZeroSizeTradeLogger:
         now_str = datetime.now(ET).strftime("%H:%M:%S ET")
         lines = [f"🔍 **+{count} more zero-size trades in window** ({now_str})"]
         lines.append("```")
-        lines.append(f"{'#':<4} {'Time':<12} {'Exchange':<22} {'Seq':<10} {'Conds'}")
+        lines.append(f"{'#':<4} {'Time':<12} {'Price':<9} {'Exchange':<22} {'Conds'}")
         lines.append("-" * 65)
         for i, t in enumerate(remaining, 1):
             exch = t['exchange_name'][:21]
             conds_str = '|'.join(str(c) for c in t['conditions']) if t['conditions'] else '-'
-            lines.append(f"{i:<4} {t['time_est']:<12} {exch:<22} {str(t['sequence']):<10} {conds_str}")
+            lines.append(f"{i:<4} {t['time_est']:<12} ${t['price']:<8.2f} {exch:<22} {conds_str}")
         lines.append("```")
         await send_discord_zero("\n".join(lines))
 
@@ -1928,6 +1928,10 @@ async def run(shared=None):
                         # Increment trade counter for initial range establishment
                         initial_trades_count += 1
 
+                        # Filter out zero-size trades from all detection systems —
+                        # they are reference/reporting artifacts, not real trades
+                        is_real_trade = size > 0
+
                         # Filter out bad conditions (needed by multiple detection systems)
                         bad_conditions = any(c in IGNORE_CONDITIONS for c in conds)
 
@@ -1971,7 +1975,7 @@ async def run(shared=None):
                         # UPDATE RANGES - Only for non-phantom trades
                         # Phantom prints shouldn't pollute the real trading range
                         # ====================================================================
-                        if not is_phantom:
+                        if not is_phantom and is_real_trade:
                             # Update today's full session range
                             if today_low is None or price < today_low:
                                 today_low = price
@@ -2001,7 +2005,7 @@ async def run(shared=None):
                         # VELOCITY DIVERGENCE TRACKING
                         # Track trades in rolling windows, detect when velocity drops at extremes
                         # ====================================================================
-                        if VELOCITY_ENABLED and not bad_conditions:
+                        if VELOCITY_ENABLED and is_real_trade and not bad_conditions:
                             current_time = time_module.time()
                             
                             # Initialize or rotate velocity window
