@@ -1473,14 +1473,17 @@ async def is_market_holiday():
         url = "https://api.massive.io/v1/marketstatus/upcoming"
         headers = {"Authorization": f"Bearer {MASSIVE_API_KEY}"}
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status != 200:
-                    print(f"⚠️ Market status API returned {response.status}, assuming market open", flush=True)
-                    return False
-                data = await response.json()
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: requests.get(url, headers=headers, timeout=10)
+        )
 
-        # Log raw response once for debugging field names
+        if response.status_code != 200:
+            print(f"⚠️ Market status API returned {response.status_code}, assuming market open", flush=True)
+            return False
+
+        data = response.json()
         print(f"📅 Market status response: {str(data)[:300]}", flush=True)
 
         # The endpoint returns a list of upcoming market status entries.
@@ -1647,7 +1650,8 @@ class QCTTracker:
 async def fetch_official_daily_volume(symbol: str, api_key: str) -> int | None:
     """
     Fetch today's official total volume from Massive REST API.
-    Uses the open-close endpoint: /v1/open-close/{symbol}/{date}
+    Uses /v1/open-close/{symbol}/{date} endpoint.
+    Uses requests (sync) via executor — same pattern as other working Massive REST calls.
     Returns volume as int, or None if the call fails.
     """
     try:
@@ -1655,20 +1659,24 @@ async def fetch_official_daily_volume(symbol: str, api_key: str) -> int | None:
         url = f"https://api.massive.io/v1/open-close/{symbol}/{today.isoformat()}"
         headers = {"Authorization": f"Bearer {api_key}"}
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status != 200:
-                    text = await r.text()
-                    print(f"⚠️ Massive open-close API returned {r.status}: {text[:100]}", flush=True)
-                    return None
-                data = await r.json()
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: requests.get(url, headers=headers, timeout=10)
+        )
 
-        # Response field for volume — log full response once so we can verify field name
+        if response.status_code != 200:
+            print(f"⚠️ Massive open-close API returned {response.status_code}: {response.text[:100]}", flush=True)
+            return None
+
+        data = response.json()
         print(f"✅ Massive open-close response: {data}", flush=True)
+
         vol = int(data.get("volume", data.get("v", 0)))
         if vol == 0:
             print("⚠️ Volume field was 0 or missing in open-close response", flush=True)
             return None
+
         print(f"✅ Official daily volume from Massive: {vol:,}", flush=True)
         return vol
 
