@@ -22,6 +22,7 @@ MASSIVE_API_KEY = os.environ["MASSIVE_API_KEY"]
 POSTGRES_URL = os.environ["POSTGRES_URL"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 DISCORD_ZERO_WEBHOOK_URL = os.environ["DISCORD_ZERO_WEBHOOK_URL"]  # Separate channel for zero-size trade alerts
+DISCORD_ANCHOR_WEBHOOK_URL = os.environ.get("DISCORD_ANCHOR_WEBHOOK_URL", "")  # High-priority anchor formation alerts
 TRADIER_API_KEY = os.environ["TRADIER_API_KEY"]
 
 # Manual previous day range override (set in Railway environment variables)
@@ -82,6 +83,13 @@ LOG_ALL_TRADES = False
 # Zero-size trade logging
 ZERO_SIZE_LOGGING_ENABLED = os.environ.get("ZERO_SIZE_LOGGING", "true").lower() in ("true", "1", "yes")
 
+# Anchor detection settings
+ANCHOR_ENABLED = os.environ.get("ANCHOR_ENABLED", "true").lower() in ("true", "1", "yes")
+ANCHOR_WINDOW_SEC = float(os.environ.get("ANCHOR_WINDOW_SEC", "2"))       # Rolling window in seconds
+ANCHOR_THRESHOLD = int(os.environ.get("ANCHOR_THRESHOLD", "1000"))        # Prints in window to trigger
+ANCHOR_PRICE_TOLERANCE = float(os.environ.get("ANCHOR_PRICE_TOLERANCE", "0.05"))  # +-$0.05 price bucket
+ANCHOR_COOLDOWN = int(os.environ.get("ANCHOR_COOLDOWN", "300"))           # 5 min cooldown per price level
+
 # ======================================================
 # SIP CONDITION FILTERING
 # ======================================================
@@ -121,6 +129,86 @@ async def send_discord_zero(msg: str):
             await session.post(DISCORD_ZERO_WEBHOOK_URL, json={"content": msg})
     except Exception as e:
         print(f"⚠️ Discord zero-size webhook failed: {e}", flush=True)
+
+async def send_discord_anchor(msg: str):
+    """Send to the high-priority anchor formation channel (DISCORD_ANCHOR_WEBHOOK_URL).
+    Falls back to the main Discord channel if anchor webhook not configured."""
+    url = DISCORD_ANCHOR_WEBHOOK_URL if DISCORD_ANCHOR_WEBHOOK_URL else DISCORD_WEBHOOK_URL
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.post(url, json={"content": msg})
+    except Exception as e:
+        print(f"⚠️ Discord anchor webhook failed: {e}", flush=True)
+
+# ======================================================
+# ANCHOR DETECTOR
+# Watches zero-size [10|37|41] prints for density spikes
+# at a single price level — signals institutional cost basis
+# Does NOT touch CSV/JSON — read-only observer of the trade stream
+# ======================================================
+class AnchorDetector:
+    """
+    Detects anchor formation: 1000+ zero-size prints at the same price
+    (within ANCHOR_PRICE_TOLERANCE) in a rolling ANCHOR_WINDOW_SEC window.
+
+    Fires a high-priority Discord alert the moment the threshold is crossed,
+    then stays quiet on that price level for ANCHOR_COOLDOWN seconds.
+
+    Completely separate from ZeroSizeTradeLogger — does not read or write
+    any CSV/JSON files. Safe to add/remove without affecting logging.
+    """
+
+    def __init__(self):
+        # price_bucket -> deque of unix timestamps (float)
+        self._buckets: dict[float, deque] = defaultdict(deque)
+        # price_bucket -> last alert time (unix float), for cooldown
+        self._last_alert: dict[float, float] = {}
+
+    def _get_bucket(self, price: float) -> float:
+        """Round price to nearest ANCHOR_PRICE_TOLERANCE to create stable buckets."""
+        tol = ANCHOR_PRICE_TOLERANCE
+        return round(round(price / tol) * tol, 4)
+
+    def feed(self, price: float, conditions: list, ts_unix: float) -> float | None:
+        """
+        Call this for every zero-size trade.
+        Returns the bucket price if an anchor alert should fire, else None.
+        Only tracks prints that include condition 10 (stopped stock / guaranteed fill).
+        """
+        if not ANCHOR_ENABLED:
+            return None
+        if 10 not in conditions:
+            return None
+
+        bucket = self._get_bucket(price)
+        dq = self._buckets[bucket]
+
+        # Append current timestamp
+        dq.append(ts_unix)
+
+        # Evict timestamps outside the rolling window
+        cutoff = ts_unix - ANCHOR_WINDOW_SEC
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+
+        count = len(dq)
+
+        # Check threshold
+        if count >= ANCHOR_THRESHOLD:
+            last = self._last_alert.get(bucket, 0)
+            if ts_unix - last >= ANCHOR_COOLDOWN:
+                self._last_alert[bucket] = ts_unix
+                return bucket  # caller fires the alert
+
+        return None
+
+    def get_count(self, price: float, ts_unix: float) -> int:
+        """Return current print count for a price bucket (for use in alert message)."""
+        bucket = self._get_bucket(price)
+        dq = self._buckets[bucket]
+        cutoff = ts_unix - ANCHOR_WINDOW_SEC
+        return sum(1 for t in dq if t >= cutoff)
+
 
 # ======================================================
 # ZERO-SIZE TRADE LOGGER
@@ -1803,6 +1891,13 @@ async def run(shared=None):
         print("✅ Zero-size trade logging ENABLED", flush=True)
     else:
         print("⏸️ Zero-size trade logging DISABLED", flush=True)
+
+    # Initialize anchor detector (independent of zero_logger)
+    anchor_detector = AnchorDetector()
+    if ANCHOR_ENABLED:
+        print(f"⚓ Anchor detector ENABLED — threshold={ANCHOR_THRESHOLD} prints / {ANCHOR_WINDOW_SEC}s window, tolerance=±${ANCHOR_PRICE_TOLERANCE}", flush=True)
+    else:
+        print("⏸️ Anchor detector DISABLED", flush=True)
     
     # Initialize dark pool tracker
     dark_pool_tracker = DarkPoolTracker(SYMBOL, DARK_POOL_SIZE_THRESHOLD)
@@ -1962,6 +2057,23 @@ async def run(shared=None):
 
                             # Flush [37]-only TRF summary to Discord once per hour
                             asyncio.create_task(zero_logger.flush_trf_hourly())
+
+                        # ── ANCHOR DETECTOR ─────────────────────────────────────────────
+                        # Runs on ALL zero-size trades regardless of zero_logger state.
+                        # Does not touch CSV/JSON — pure in-memory density check.
+                        if size == 0 and ANCHOR_ENABLED:
+                            ts_unix = sip_ts_raw / 1000.0
+                            triggered_bucket = anchor_detector.feed(price, conds, ts_unix)
+                            if triggered_bucket is not None:
+                                count = anchor_detector.get_count(triggered_bucket, ts_unix)
+                                now_str = datetime.fromtimestamp(ts_unix, tz=ET).strftime("%H:%M:%S ET")
+                                anchor_msg = (
+                                    f"⚓ **ANCHOR FORMING** ({now_str})\n"
+                                    f"`${triggered_bucket:.2f}  —  {count:,} prints in {ANCHOR_WINDOW_SEC}s window`\n"
+                                    f"Conditions: {conds}  |  Cooldown: {ANCHOR_COOLDOWN}s per level"
+                                )
+                                print(f"⚓ ANCHOR DETECTED ${triggered_bucket:.2f} — {count:,} prints in {ANCHOR_WINDOW_SEC}s", flush=True)
+                                asyncio.create_task(send_discord_anchor(anchor_msg))
 
                         # Update session-specific categories FIRST (needed for categorization)
                         in_premarket = time(4, 0) <= tm < time(9, 30)
