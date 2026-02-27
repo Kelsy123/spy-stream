@@ -453,10 +453,10 @@ class ZeroSizeTradeLogger:
 
         count = len(batch)
         now_str = datetime.now(ET).strftime("%H:%M:%S ET")
-        print(f"\n🔍 Zero-size trades logged ({count} in last 30s) — {now_str}", flush=True)
-        for t in batch:
-            conds_str = '|'.join(str(c) for c in t['conditions']) if t['conditions'] else '-'
-            print(f"   {t['time_est']}  ${t['price']:.2f}  seq={t['sequence']}  conds={conds_str}", flush=True)
+        prices = [t['price'] for t in batch]
+        lo, hi = min(prices), max(prices)
+        # Single summary line regardless of batch size — prevents Railway 500 logs/s limit
+        print(f"🔍 Zero-size: {count} trades in last 30s | ${lo:.2f}–${hi:.2f} | {now_str}", flush=True)
     
     def get_exchange_name(self, code):
         """Convert exchange code to readable name"""
@@ -2518,3 +2518,4 @@ if __name__ == "__main__":
         print("❌ Fatal crash:", e, flush=True)
         traceback.print_exc()
         raise
+
