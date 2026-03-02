@@ -115,30 +115,37 @@ def ts_str():
 # ======================================================
 # DISCORD ALERTS
 # ======================================================
+async def _send_with_retry(url: str, msg: str, label: str, retries: int = 3, delay: float = 2.0):
+    """
+    Core Discord delivery with retry. All send_discord* functions use this.
+    Attempts up to `retries` times with `delay` seconds between attempts.
+    Logs each failure and gives up cleanly after all retries are exhausted.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                resp = await session.post(url, json={"content": msg})
+                if resp.status in (200, 204):
+                    return  # success
+                print(f"⚠️ {label} HTTP {resp.status} (attempt {attempt}/{retries})", flush=True)
+        except Exception as e:
+            print(f"⚠️ {label} failed: {e} (attempt {attempt}/{retries})", flush=True)
+        if attempt < retries:
+            await asyncio.sleep(delay)
+    print(f"❌ {label} gave up after {retries} attempts", flush=True)
+
 async def send_discord(msg: str):
-    try:
-        async with aiohttp.ClientSession() as session:
-            await session.post(DISCORD_WEBHOOK_URL, json={"content": msg})
-    except Exception as e:
-        print(f"⚠️ Discord webhook failed: {e}", flush=True)
+    await _send_with_retry(DISCORD_WEBHOOK_URL, msg, "Discord")
 
 async def send_discord_zero(msg: str):
     """Send to the dedicated zero-size trade Discord channel (DISCORD_ZERO_WEBHOOK_URL)."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            await session.post(DISCORD_ZERO_WEBHOOK_URL, json={"content": msg})
-    except Exception as e:
-        print(f"⚠️ Discord zero-size webhook failed: {e}", flush=True)
+    await _send_with_retry(DISCORD_ZERO_WEBHOOK_URL, msg, "Discord-zero")
 
 async def send_discord_anchor(msg: str):
     """Send to the high-priority anchor formation channel (DISCORD_ANCHOR_WEBHOOK_URL).
     Falls back to the main Discord channel if anchor webhook not configured."""
     url = DISCORD_ANCHOR_WEBHOOK_URL if DISCORD_ANCHOR_WEBHOOK_URL else DISCORD_WEBHOOK_URL
-    try:
-        async with aiohttp.ClientSession() as session:
-            await session.post(url, json={"content": msg})
-    except Exception as e:
-        print(f"⚠️ Discord anchor webhook failed: {e}", flush=True)
+    await _send_with_retry(url, msg, "Discord-anchor")
 
 # ======================================================
 # ANCHOR DETECTOR
@@ -231,10 +238,10 @@ class ZeroSizeTradeLogger:
         self.zero_trades = []
 
         # --- Structural alert buffer (conditions beyond just [37]) ---
-        # First trade fires immediately, remainder batch in 10s window
+        # Batched into 30s summaries — matches console cadence, reduces Discord noise
         self._batch_buffer = []
-        self._batch_task = None
-        self._batch_window = 10.0
+        self._last_discord_flush = time_module.time()
+        self._discord_flush_interval = 30.0
 
         # --- [37]-only silent accumulator ---
         # Never pings Discord individually — flushed hourly as a single summary line
@@ -287,50 +294,45 @@ class ZeroSizeTradeLogger:
 
     def queue_discord_alert(self, trade_record):
         """
-        Route by condition:
-        - [37] only  -> silent TRF accumulator, flushed hourly (no pings)
-        - anything else -> immediate first alert + 10s batch remainder
+        Buffer structural (non-[37]) zero-size trades.
+        Discord summary fires every 30s via flush_discord_summary().
+        [37]-only trades go to the hourly TRF accumulator as before.
         """
         if self._is_trf_only(trade_record['conditions']):
             self._trf_buffer.append(trade_record)
             return
-
-        is_first = self._batch_task is None or self._batch_task.done()
         self._batch_buffer.append(trade_record)
-        if is_first:
-            asyncio.create_task(self._send_first_alert(trade_record))
-            self._batch_task = asyncio.create_task(self._flush_after_window())
 
-    async def _send_first_alert(self, record):
-        """Immediate alert for first structural (non-[37]) trade in a burst."""
+    async def flush_discord_summary(self):
+        """
+        Send one compact 30s summary of structural zero-size trades to Discord.
+        Call from the main loop on every zero-size trade — internally rate-limited.
+        Mirrors the console buffer cadence exactly.
+        """
+        now = time_module.time()
+        if now - self._last_discord_flush < self._discord_flush_interval:
+            return
+        if not self._batch_buffer:
+            self._last_discord_flush = now
+            return
+        batch = list(self._batch_buffer)
+        self._batch_buffer.clear()
+        self._last_discord_flush = now
+
+        count = len(batch)
+        prices = [t['price'] for t in batch]
+        lo, hi = min(prices), max(prices)
+        # Collect unique condition sets seen in this window
+        cond_sets = sorted({
+            '|'.join(str(c) for c in t['conditions']) for t in batch if t['conditions']
+        })
+        conds_str = ', '.join(cond_sets) if cond_sets else '-'
         now_str = datetime.now(ET).strftime("%H:%M:%S ET")
-        exch = record['exchange_name'][:21]
-        conds_str = '|'.join(str(c) for c in record['conditions']) if record['conditions'] else '-'
         msg = (
-            f"\U0001f50d **Zero-Size Trade** ({now_str})\n"
-            f"`{record['time_est']}  ${record['price']:.2f}  {exch}  seq={record['sequence']}  conds={conds_str}`"
+            f"\U0001f50d **Zero-Size 30s Summary** ({now_str})\n"
+            f"`{count} trades  |  ${lo:.2f}–${hi:.2f}  |  conds: {conds_str}`"
         )
         await send_discord_zero(msg)
-
-    async def _flush_after_window(self):
-        """10s after first alert, send one batched table for all remaining structural trades."""
-        await asyncio.sleep(self._batch_window)
-        remaining = list(self._batch_buffer[1:])
-        self._batch_buffer.clear()
-        if not remaining:
-            return
-        count = len(remaining)
-        now_str = datetime.now(ET).strftime("%H:%M:%S ET")
-        lines = [f"\U0001f50d **+{count} more zero-size trades in window** ({now_str})"]
-        lines.append("```")
-        lines.append(f"{'#':<4} {'Time':<12} {'Price':<9} {'Exchange':<22} {'Conds'}")
-        lines.append("-" * 65)
-        for i, t in enumerate(remaining, 1):
-            exch = t['exchange_name'][:21]
-            conds_str = '|'.join(str(c) for c in t['conditions']) if t['conditions'] else '-'
-            lines.append(f"{i:<4} {t['time_est']:<12} ${t['price']:<8.2f} {exch:<22} {conds_str}")
-        lines.append("```")
-        await send_discord_zero("\n".join(lines))
 
     async def flush_trf_hourly(self):
         """
@@ -2049,8 +2051,11 @@ async def run(shared=None):
                             }
                             trade_record = zero_logger.log_zero_trade(zero_trade_data)
 
-                            # Queue for batched Discord alert (first fires immediately, rest batch in 10s)
+                            # Buffer for 30s Discord summary (replaces immediate-first + 10s-batch)
                             zero_logger.queue_discord_alert(trade_record)
+
+                            # Flush Discord summary every 30s
+                            asyncio.create_task(zero_logger.flush_discord_summary())
 
                             # Flush console buffer every 30s to keep Railway logs manageable
                             zero_logger.flush_console_buffer()
@@ -2123,6 +2128,19 @@ async def run(shared=None):
                                 outside_prev and
                                 outside_current_far
                             )
+
+                            # Diagnostic: log which gate blocked phantom detection
+                            # Only fires for trades that are outside prev range but didn't fully trigger
+                            if not is_phantom and outside_prev and size > 0 and not bad_conditions:
+                                gates = []
+                                if not phantom_cond_ok:
+                                    gates.append(f"cond_ok=❌(conds={conds})")
+                                if not outside_prev:
+                                    gates.append(f"outside_prev=❌(price={price} prev=[{prev_low},{prev_high}])")
+                                if not outside_current_far:
+                                    gates.append(f"outside_current=❌(price={price} current=[{compare_low},{compare_high}] gap={PHANTOM_GAP_FROM_CURRENT})")
+                                if gates:
+                                    print(f"👻 PHANTOM BLOCKED ${price} conds={conds} | {' | '.join(gates)}", flush=True)
                         
                         now = time_module.time()
 
