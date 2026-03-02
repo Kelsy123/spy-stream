@@ -2110,7 +2110,9 @@ async def run(shared=None):
                         )
                         
                         if initial_trades_count < INITIAL_TRADES_THRESHOLD:
-                            is_phantom = False
+                            # During warmup, skip outside_current_far (range not established yet)
+                            # but still block prices already outside yesterday's range from polluting today_low/today_high
+                            is_phantom = outside_prev and phantom_cond_ok
                         else:
                             # Use CURRENT range (before this trade updates it)
                             compare_low = today_low
@@ -2536,4 +2538,3 @@ if __name__ == "__main__":
         print("❌ Fatal crash:", e, flush=True)
         traceback.print_exc()
         raise
-
