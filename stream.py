@@ -2078,7 +2078,7 @@ async def run(shared=None):
                                     f"Conditions: {conds}  |  Cooldown: {ANCHOR_COOLDOWN}s per level"
                                 )
                                 print(f"⚓ ANCHOR DETECTED ${triggered_bucket:.2f} — {count:,} prints in {ANCHOR_WINDOW_SEC}s", flush=True)
-                                asyncio.create_task(send_discord_anchor(anchor_msg))
+                                await send_discord_anchor(anchor_msg)  # await directly — guaranteed delivery before processing continues
 
                         # Update session-specific categories FIRST (needed for categorization)
                         in_premarket = time(4, 0) <= tm < time(9, 30)
