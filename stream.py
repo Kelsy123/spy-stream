@@ -74,6 +74,7 @@ PHANTOM_GAP_FROM_CURRENT = 0.25  # Fixed 25 cent gap from current day's range
 PHANTOM_COOLDOWN = 5
 # Debug
 LOG_ALL_TRADES = False
+LOG_PHANTOM_DIAGNOSTIC = os.environ.get("LOG_PHANTOM_DIAGNOSTIC", "false").lower() in ("true", "1", "yes")
 
 # Zero-size trade logging
 ZERO_SIZE_LOGGING_ENABLED = os.environ.get("ZERO_SIZE_LOGGING", "true").lower() in ("true", "1", "yes")
@@ -2205,7 +2206,8 @@ async def run(shared=None):
                                 if not outside_current_far:
                                     gates.append(f"outside_current=❌(price={price} current=[{compare_low},{compare_high}] gap={PHANTOM_GAP_FROM_CURRENT})")
                                 if gates:
-                                    print(f"👻 PHANTOM BLOCKED ${price} conds={conds} | {' | '.join(gates)}", flush=True)
+                                    if LOG_PHANTOM_DIAGNOSTIC:
+                                        print(f"👻 PHANTOM BLOCKED ${price} conds={conds} | {' | '.join(gates)}", flush=True)
                         
                         now = time_module.time()
 
@@ -2248,7 +2250,8 @@ async def run(shared=None):
                                 if afterhours_high is None or price > afterhours_high:
                                     afterhours_high = price
                         elif not range_safe and is_real_trade:
-                            print(f"🛡️ RANGE GUARD blocked ${price} conds={conds} — outside current=[{today_low},{today_high}] gap={PHANTOM_GAP_FROM_CURRENT}", flush=True)
+                            if LOG_PHANTOM_DIAGNOSTIC:
+                                print(f"🛡️ RANGE GUARD blocked ${price} conds={conds} — outside current=[{today_low},{today_high}] gap={PHANTOM_GAP_FROM_CURRENT}", flush=True)
 
                         # ====================================================================
                         # VELOCITY DIVERGENCE TRACKING
@@ -2598,3 +2601,4 @@ if __name__ == "__main__":
         print("❌ Fatal crash:", e, flush=True)
         traceback.print_exc()
         raise
+
