@@ -263,10 +263,6 @@ class ZeroSizeTradeLogger:
         """Get CSV file path for current date"""
         return self.log_dir / f"zero_trades_{self.ticker}_{self.get_today_str()}.csv"
     
-    def get_json_file(self):
-        """Get JSON file path for current date"""
-        return self.log_dir / f"zero_trades_{self.ticker}_{self.get_today_str()}.json"
-        
     def init_csv(self):
         """Create CSV file with headers if it doesn't exist"""
         csv_file = self.get_csv_file()
@@ -388,9 +384,6 @@ class ZeroSizeTradeLogger:
         # Write to CSV
         self.write_to_csv(trade_record)
         
-        # Write to JSON (append to array)
-        self.write_to_json(trade_record)
-        
         # Buffer for console — flush every 30 seconds instead of printing every trade
         self._console_buffer.append(trade_record)
         
@@ -416,26 +409,6 @@ class ZeroSizeTradeLogger:
                 record['trf_timestamp'],
                 record['trf_id']
             ])
-    
-    def write_to_json(self, record):
-        """Append record to JSON file"""
-        json_file = self.get_json_file()
-        # Read existing data
-        if json_file.exists():
-            with open(json_file, 'r') as f:
-                try:
-                    data = json.load(f)
-                except json.JSONDecodeError:
-                    data = []
-        else:
-            data = []
-        
-        # Append new record
-        data.append(record)
-        
-        # Write back
-        with open(json_file, 'w') as f:
-            json.dump(data, f, indent=2)
     
     def flush_console_buffer(self):
         """
@@ -538,7 +511,6 @@ Last:  {self.zero_trades[-1]['time_est']}
 
 Log files saved to:
 CSV:  {self.get_csv_file()}
-JSON: {self.get_json_file()}
 
 {'='*80}
 """
@@ -2150,7 +2122,15 @@ async def run(shared=None):
                         # UPDATE RANGES - Only for non-phantom trades
                         # Phantom prints shouldn't pollute the real trading range
                         # ====================================================================
-                        if not is_phantom and is_real_trade:
+                        # Hard prev-range guard: never let any price outside yesterday's range
+                        # (by more than PHANTOM_OUTSIDE_PREV) update today's range — regardless
+                        # of conditions, size, or whether phantom detection fully triggered.
+                        range_safe = (
+                            prev_low is None or prev_high is None or
+                            (price >= prev_low - PHANTOM_OUTSIDE_PREV and
+                             price <= prev_high + PHANTOM_OUTSIDE_PREV)
+                        )
+                        if range_safe and not is_phantom and is_real_trade:
                             # Update today's full session range
                             if today_low is None or price < today_low:
                                 today_low = price
@@ -2175,6 +2155,8 @@ async def run(shared=None):
                                     afterhours_low = price
                                 if afterhours_high is None or price > afterhours_high:
                                     afterhours_high = price
+                        elif not range_safe and is_real_trade:
+                            print(f"🛡️ RANGE GUARD blocked ${{price}} conds={{conds}} — outside prev=[{{prev_low}},{{prev_high}}]", flush=True)
 
                         # ====================================================================
                         # VELOCITY DIVERGENCE TRACKING
@@ -2538,3 +2520,4 @@ if __name__ == "__main__":
         print("❌ Fatal crash:", e, flush=True)
         traceback.print_exc()
         raise
+
