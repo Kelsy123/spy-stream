@@ -72,11 +72,6 @@ PHANTOM_GAP_FROM_CURRENT = 0.25  # Fixed 25 cent gap from current day's range
 
 # Cooldowns
 PHANTOM_COOLDOWN = 5
-RTH_COOLDOWN = 120
-
-# RTH breakout buffer
-RTH_BREAK_BUFFER = 0.10
-
 # Debug
 LOG_ALL_TRADES = False
 
@@ -1787,6 +1782,82 @@ async def fetch_official_daily_volume(symbol: str, api_key: str) -> int | None:
         return None
 
 
+async def fetch_today_range(symbol: str, api_key: str) -> tuple[float, float] | tuple[None, None]:
+    """
+    Fetch today's official low/high from Massive's daily aggregate endpoint.
+    Used every 5 minutes to correct today_low/today_high against server-validated data,
+    ensuring phantom prints that slip through trade-by-trade detection can't permanently
+    contaminate the range.
+    Returns (low, high) floats, or (None, None) if unavailable (pre-market, no data yet).
+    """
+    try:
+        today = datetime.now(ET).date()
+        url = f"https://api.massive.com/v1/stocks/aggregates/{symbol}/range/1/day/{today.isoformat()}/{today.isoformat()}"
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: requests.get(url, headers=headers, timeout=10)
+        )
+
+        if response.status_code != 200:
+            # 404 is normal pre-market or on non-trading days — don't warn
+            if response.status_code != 404:
+                print(f"⚠️ fetch_today_range: API returned {response.status_code}", flush=True)
+            return None, None
+
+        data = response.json()
+        results = data.get("results", [])
+        if not results:
+            return None, None
+
+        today_data = results[-1]
+        low  = float(today_data["l"])
+        high = float(today_data["h"])
+        print(f"📊 Today's range from Massive API: low={low} high={high}", flush=True)
+        return low, high
+
+    except Exception as e:
+        print(f"⚠️ fetch_today_range error: {e}", flush=True)
+        return None, None
+    """
+    Fetch today's official total volume from Massive REST API.
+    Uses /v1/open-close/{symbol}/{date} endpoint.
+    Uses requests (sync) via executor — same pattern as other working Massive REST calls.
+    Returns volume as int, or None if the call fails.
+    """
+    try:
+        today = datetime.now(ET).date()
+        url = f"https://api.massive.com/v1/open-close/{symbol}/{today.isoformat()}"
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: requests.get(url, headers=headers, timeout=10)
+        )
+
+        if response.status_code != 200:
+            print(f"⚠️ Massive open-close API returned {response.status_code}: {response.text[:100]}", flush=True)
+            return None
+
+        data = response.json()
+        print(f"✅ Massive open-close response: {data}", flush=True)
+
+        vol = int(data.get("volume", data.get("v", 0)))
+        if vol == 0:
+            print("⚠️ Volume field was 0 or missing in open-close response", flush=True)
+            return None
+
+        print(f"✅ Official daily volume from Massive: {vol:,}", flush=True)
+        return vol
+
+    except Exception as e:
+        print(f"⚠️ fetch_official_daily_volume error: {e}", flush=True)
+        return None
+
+
 async def run_qct_scheduler(qct_tracker):
     """
     Separate coroutine — runs alongside the main websocket loop via asyncio.gather.
@@ -1891,14 +1962,16 @@ async def run(shared=None):
     today_high = None
     premarket_low = None
     premarket_high = None
-    rth_low = None
-    rth_high = None
     afterhours_low = None
     afterhours_high = None
+
+    # Today's range API poll — corrects today_low/today_high every 5 minutes
+    # against Massive's server-validated data, preventing phantom contamination
+    TODAY_RANGE_POLL_INTERVAL = 300  # seconds
+    last_today_range_poll = 0.0
     
     # Cooldown tracking
     last_phantom_alert = 0
-    last_rth_alert = 0
     last_velocity_alert = 0
     
     # Velocity divergence tracking
@@ -2004,6 +2077,24 @@ async def run(shared=None):
                         # Reset flag for new day
                         if last_summary_date is not None and current_date > last_summary_date:
                             summary_generated_today = False
+
+                        # ====================================================================
+                        # TODAY'S RANGE POLL — correct today_low/today_high every 5 minutes
+                        # from Massive's server-validated aggregate data.
+                        # Phantom prints excluded server-side, so any contamination from
+                        # missed phantoms gets corrected automatically each poll cycle.
+                        # ====================================================================
+                        now_poll = time_module.time()
+                        if now_poll - last_today_range_poll >= TODAY_RANGE_POLL_INTERVAL:
+                            last_today_range_poll = now_poll
+                            api_low, api_high = await fetch_today_range(SYMBOL, MASSIVE_API_KEY)
+                            if api_low is not None and api_high is not None:
+                                # Only correct downward/upward if API is more conservative than current
+                                # (i.e. reset contaminated extremes, don't override genuine moves)
+                                if today_low is None or api_low > today_low:
+                                    today_low = api_low
+                                if today_high is None or api_high < today_high:
+                                    today_high = api_high
 
                         # ====================================================================
                         # ZERO-SIZE TRADE DETECTION
@@ -2122,14 +2213,21 @@ async def run(shared=None):
                         # UPDATE RANGES - Only for non-phantom trades
                         # Phantom prints shouldn't pollute the real trading range
                         # ====================================================================
-                        # Hard prev-range guard: never let any price outside yesterday's range
-                        # (by more than PHANTOM_OUTSIDE_PREV) update today's range — regardless
-                        # of conditions, size, or whether phantom detection fully triggered.
-                        range_safe = (
-                            prev_low is None or prev_high is None or
-                            (price >= prev_low - PHANTOM_OUTSIDE_PREV and
-                             price <= prev_high + PHANTOM_OUTSIDE_PREV)
-                        )
+                        # Range guard: once warmup is complete and today's range is established,
+                        # block any price more than PHANTOM_GAP_FROM_CURRENT ($0.25) beyond the
+                        # current range. The 5-minute API poll resets any contamination so this
+                        # guard only needs to catch intra-poll phantoms.
+                        # Before warmup (first 100 trades) let everything through — phantom
+                        # detection handles out-of-range prices during that window.
+                        if (initial_trades_count >= INITIAL_TRADES_THRESHOLD and
+                                today_low is not None and today_high is not None):
+                            range_safe = (
+                                price >= today_low - PHANTOM_GAP_FROM_CURRENT and
+                                price <= today_high + PHANTOM_GAP_FROM_CURRENT
+                            )
+                        else:
+                            range_safe = True  # Warmup or range not established — let through
+
                         if range_safe and not is_phantom and is_real_trade:
                             # Update today's full session range
                             if today_low is None or price < today_low:
@@ -2144,19 +2242,13 @@ async def run(shared=None):
                                 if premarket_high is None or price > premarket_high:
                                     premarket_high = price
                                     
-                            elif in_rth:
-                                if rth_low is None or price < rth_low:
-                                    rth_low = price
-                                if rth_high is None or price > rth_high:
-                                    rth_high = price
-                                    
                             elif in_afterhours:
                                 if afterhours_low is None or price < afterhours_low:
                                     afterhours_low = price
                                 if afterhours_high is None or price > afterhours_high:
                                     afterhours_high = price
                         elif not range_safe and is_real_trade:
-                            print(f"🛡️ RANGE GUARD blocked ${{price}} conds={{conds}} — outside prev=[{{prev_low}},{{prev_high}}]", flush=True)
+                            print(f"🛡️ RANGE GUARD blocked ${price} conds={conds} — outside current=[{today_low},{today_high}] gap={PHANTOM_GAP_FROM_CURRENT}", flush=True)
 
                         # ====================================================================
                         # VELOCITY DIVERGENCE TRACKING
@@ -2412,20 +2504,6 @@ async def run(shared=None):
                             # Use complete_record which has notional calculated
                             asyncio.create_task(dark_pool_tracker.queue_for_alert(complete_record))
                         
-                        # RTH breakout logic
-                        if in_rth and not bad_conditions:
-                            if rth_high is not None and rth_low is not None:
-                                breakout = price > rth_high + RTH_BREAK_BUFFER or price < rth_low - RTH_BREAK_BUFFER
-                                
-                                if breakout and not is_phantom and now - last_rth_alert > RTH_COOLDOWN:
-                                    last_rth_alert = now
-                                    print(
-                                        f"🚨 RTH BREAKOUT {ts_str()} ${price} "
-                                        f"size={size} conds={conds} exch={exch} "
-                                        f"rth=[{rth_low},{rth_high}]",
-                                        flush=True
-                                    )
-                                    
         except websockets.exceptions.ConnectionClosed as e:
             print(f"⚠️ Websocket closed: {e}", flush=True)
             print("🔁 Reconnecting in 5 seconds...", flush=True)
@@ -2520,4 +2598,3 @@ if __name__ == "__main__":
         print("❌ Fatal crash:", e, flush=True)
         traceback.print_exc()
         raise
-
