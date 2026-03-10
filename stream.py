@@ -999,7 +999,13 @@ class PhantomPrintTracker:
         
         # In-memory storage for session
         self.phantom_prints = []
-        
+
+        # Batching system for Discord alerts — same pattern as DarkPoolTracker
+        # Collects phantoms for PHANTOM_BATCH_WINDOW seconds, then sends one grouped alert
+        self._pending_batch: list = []
+        self._batch_task = None
+        self._batch_window = 10  # seconds to collect before firing grouped alert
+
         print(f"👻 Phantom print tracker initialized.", flush=True)
     
     def get_today_str(self):
@@ -1151,6 +1157,88 @@ ALL PHANTOM PRINTS (Chronological Order)
         
         return msg
     
+    async def queue_for_alert(self, phantom_record):
+        """
+        Add phantom to batch queue and (re)start the grouping timer.
+        After _batch_window seconds of silence, one grouped Discord alert fires.
+        Individual phantoms are ALWAYS written to CSV/in-memory immediately —
+        this only controls Discord delivery.
+        """
+        self._pending_batch.append(phantom_record)
+
+        # Reset the timer each time a new phantom arrives
+        if self._batch_task and not self._batch_task.done():
+            self._batch_task.cancel()
+        self._batch_task = asyncio.create_task(self._send_batched_alert())
+
+    async def _send_batched_alert(self):
+        """
+        Wait _batch_window seconds, then send a single grouped Discord alert.
+        If more phantoms arrive during the wait, the timer resets (via queue_for_alert).
+        """
+        try:
+            await asyncio.sleep(self._batch_window)
+
+            if not self._pending_batch:
+                return
+
+            batch = list(self._pending_batch)
+            self._pending_batch.clear()
+
+            count = len(batch)
+            prices = [p['price'] for p in batch]
+            lo, hi = min(prices), max(prices)
+            sizes = [p['size'] for p in batch]
+            distances = [p['distance'] for p in batch]
+            max_dist = max(distances)
+
+            # Collect unique condition combos
+            cond_sets = sorted({
+                '|'.join(str(c) for c in p['conditions']) for p in batch if p['conditions']
+            })
+            conds_str = ', '.join(cond_sets) if cond_sets else '-'
+
+            # Unique exchanges
+            exchanges = sorted({p['exchange'] for p in batch})
+            exch_str = ', '.join(str(e) for e in exchanges)
+
+            first_time = batch[0]['time_est']
+            last_time  = batch[-1]['time_est']
+            now_str    = datetime.now(ET).strftime("%H:%M:%S ET")
+
+            if count == 1:
+                p = batch[0]
+                msg = (
+                    f"🚨 **{SYMBOL} Phantom Print Detected** ({now_str})\n"
+                    f"Price: **${p['price']}**  |  Size: {p['size']}  |  Exch: {p['exchange']}\n"
+                    f"Conditions: {conds_str}\n"
+                    f"Distance from range: **${p['distance']:.2f}**\n"
+                    f"Sequence: {p['sequence']}  |  TRF ID: {p['trf_id']}"
+                )
+            else:
+                # Show up to 5 individual lines; summarise the rest
+                lines = []
+                for i, p in enumerate(batch[:5]):
+                    lines.append(
+                        f"  ${p['price']}  sz={p['size']}  dist=${p['distance']:.2f}  seq={p['sequence']}"
+                    )
+                if count > 5:
+                    lines.append(f"  … +{count - 5} more (all logged to CSV)")
+                detail = '\n'.join(lines)
+
+                msg = (
+                    f"🚨🚨 **{SYMBOL} Phantom Burst — {count} prints** ({now_str})\n"
+                    f"Price range: **${lo:.2f} – ${hi:.2f}**  |  Max dist: **${max_dist:.2f}**\n"
+                    f"Exchanges: {exch_str}  |  Conditions: {conds_str}\n"
+                    f"Window: {first_time} – {last_time}\n"
+                    f"```\n{detail}\n```"
+                )
+
+            asyncio.create_task(send_discord(msg))
+
+        except asyncio.CancelledError:
+            pass  # Normal — new phantom restarted the timer
+
     async def save_summary(self):
         """Save daily summary to file and send to Discord"""
         summary = self.get_daily_summary()
@@ -2437,24 +2525,11 @@ async def run(shared=None):
                                 'trf_timestamp': trf_ts_raw,
                                 'trf_id': trf_id
                             }
-                            phantom_tracker.log_phantom_print(phantom_trade_data, distance)
-                            
-                            # ALWAYS SEND TO DISCORD
-                            msg = (
-                                f"🚨 **{SYMBOL} Phantom Print Detected**\n"
-                                f"Price: **${price}**\n"
-                                f"Size: {size}\n"
-                                f"Exchange: {exch}\n"
-                                f"Conditions: {conds}\n"
-                                f"Distance from range: ${distance:.2f}\n"
-                                f"Previous day: [{prev_low}, {prev_high}]\n"
-                                f"Current range: [{compare_low}, {compare_high}]\n"
-                                f"SIP Time: {datetime.fromtimestamp(sip_ts_raw/1000, tz=ET)}\n"
-                                f"TRF Time: {datetime.fromtimestamp(trf_ts_raw/1000, tz=ET) if trf_ts_raw else 'None'}\n"
-                                f"Sequence: {sequence}\n"
-                                f"TRF ID: {trf_id}"
-                            )
-                            asyncio.create_task(send_discord(msg))
+                            phantom_record = phantom_tracker.log_phantom_print(phantom_trade_data, distance)
+
+                            # BATCHED DISCORD ALERT — groups bursts into one message
+                            # (replaces per-print fire that caused thousands of pings at 8AM)
+                            asyncio.create_task(phantom_tracker.queue_for_alert(phantom_record))
                             
                             # INSERT INTO POSTGRES (with connection check)
                             try:
@@ -2566,29 +2641,27 @@ if __name__ == "__main__":
         """Handle shutdown signals and generate final summaries"""
         print("\n\n🛑 Shutdown signal received. Generating final summaries...", flush=True)
         
-        # Zero-size summary
-        if global_zero_logger and global_zero_logger.zero_trades:
-            summary = global_zero_logger.get_daily_summary()
-            summary_file = global_zero_logger.log_dir / f"summary_{global_zero_logger.ticker}_{global_zero_logger.today}.txt"
-            with open(summary_file, 'w') as f:
-                f.write(summary)
-            print(summary, flush=True)
-        
-        # Dark pool summary
-        if global_dark_pool_tracker and global_dark_pool_tracker.dark_pool_prints:
-            summary = global_dark_pool_tracker.get_daily_summary()
-            summary_file = global_dark_pool_tracker.log_dir / f"summary_dark_pool_{global_dark_pool_tracker.ticker}_{global_dark_pool_tracker.today}.txt"
-            with open(summary_file, 'w') as f:
-                f.write(summary)
-            print(summary, flush=True)
-        
-        # Phantom print summary
-        if global_phantom_tracker and global_phantom_tracker.phantom_prints:
-            summary = global_phantom_tracker.get_daily_summary()
-            summary_file = global_phantom_tracker.log_dir / f"summary_phantoms_{global_phantom_tracker.ticker}_{global_phantom_tracker.today}.txt"
-            with open(summary_file, 'w') as f:
-                f.write(summary)
-            print(summary, flush=True)
+        async def _shutdown_async():
+            # Zero-size summary + CSV upload to Discord
+            if global_zero_logger and global_zero_logger.zero_trades:
+                await global_zero_logger.save_summary()  # handles CSV upload to Discord
+            
+            # Dark pool summary
+            if global_dark_pool_tracker and global_dark_pool_tracker.dark_pool_prints:
+                await global_dark_pool_tracker.save_summary()
+            
+            # Phantom print summary
+            if global_phantom_tracker and global_phantom_tracker.phantom_prints:
+                await global_phantom_tracker.save_summary()
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(_shutdown_async())
+            else:
+                loop.run_until_complete(_shutdown_async())
+        except Exception as e:
+            print(f"⚠️ Error during shutdown summaries: {e}", flush=True)
         
         exit(0)
     
@@ -2603,3 +2676,4 @@ if __name__ == "__main__":
         print("❌ Fatal crash:", e, flush=True)
         traceback.print_exc()
         raise
+
