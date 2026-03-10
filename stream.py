@@ -2266,7 +2266,7 @@ async def run(shared=None):
                             # but still block prices already outside yesterday's range from polluting today_low/today_high
                             compare_low = today_low
                             compare_high = today_high
-                            is_phantom = outside_prev and phantom_cond_ok
+                            is_phantom = outside_prev and phantom_cond_ok and exch == 4
                         else:
                             # Use CURRENT range (before this trade updates it)
                             compare_low = today_low
@@ -2282,7 +2282,8 @@ async def run(shared=None):
                             is_phantom = (
                                 phantom_cond_ok and
                                 outside_prev and
-                                outside_current_far
+                                outside_current_far and
+                                exch == 4
                             )
 
                             # Diagnostic: log which gate blocked phantom detection
@@ -2676,4 +2677,3 @@ if __name__ == "__main__":
         print("❌ Fatal crash:", e, flush=True)
         traceback.print_exc()
         raise
-
