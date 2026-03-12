@@ -2162,6 +2162,13 @@ async def run(shared=None):
                             
                             summary_generated_today = True
                             last_summary_date = current_date
+
+                            # Clear in-memory lists so yesterday's data doesn't bleed into tomorrow's summary
+                            if zero_logger:
+                                zero_logger.zero_trades.clear()
+                            dark_pool_tracker.dark_pool_prints.clear()
+                            phantom_tracker.phantom_prints.clear()
+                            print("🧹 In-memory trade lists cleared for new day.", flush=True)
                         
                         # Reset flag for new day
                         if last_summary_date is not None and current_date > last_summary_date:
