@@ -2054,6 +2054,20 @@ async def run(shared=None):
     afterhours_low = None
     afterhours_high = None
 
+    # ── Startup range seed ──────────────────────────────────────────────────
+    # Fetch today's validated range immediately on startup so that a mid-session
+    # restart doesn't spend 100 trades rebuilding a range from scratch (which
+    # would be missing all pre-market / earlier session activity).
+    print("🔍 Fetching current session range before starting stream...", flush=True)
+    seed_low, seed_high = await fetch_today_range(SYMBOL, MASSIVE_API_KEY)
+    if seed_low is not None and seed_high is not None:
+        today_low = seed_low
+        today_high = seed_high
+        print(f"✅ Startup range seeded: low={today_low} high={today_high} — phantom detection active immediately", flush=True)
+    else:
+        print("⚠️ No session range available yet (pre-market or non-trading day) — will build from incoming trades", flush=True)
+    # ────────────────────────────────────────────────────────────────────────
+
     # Today's range API poll — corrects today_low/today_high every 5 minutes
     # against Massive's server-validated data, preventing phantom contamination
     TODAY_RANGE_POLL_INTERVAL = 300  # seconds
@@ -2069,8 +2083,9 @@ async def run(shared=None):
     velocity_confirmation_count = 0  # Track consecutive divergence windows
     
     # Tracking for initial range establishment
-    initial_trades_count = 0
+    # If startup seed succeeded, skip warmup — range is already known
     INITIAL_TRADES_THRESHOLD = 100  # Wait for 100 trades before enabling phantom detection
+    initial_trades_count = 0 if today_low is None else INITIAL_TRADES_THRESHOLD
     
     # Track last summary generation time (generate once at end of day)
     last_summary_date = None
