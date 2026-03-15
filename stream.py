@@ -108,6 +108,30 @@ def to_float(x):
 def ts_str():
     return datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S %Z")
 
+async def _weekend_sleep():
+    """
+    If it's currently Saturday or Sunday ET, sleep until Monday 00:00:00 ET.
+    Returns immediately on weekdays. Call before any websocket reconnect attempt.
+    """
+    now = datetime.now(ET)
+    wd = now.weekday()  # 5=Saturday, 6=Sunday
+    if wd not in (5, 6):
+        return  # weekday — nothing to do
+
+    # Calculate seconds until Monday midnight ET
+    days_until_monday = 7 - wd  # Sat→2, Sun→1
+    monday_midnight = datetime.combine(
+        now.date() + timedelta(days=days_until_monday), time(0, 0, 0)
+    ).replace(tzinfo=ET)
+    sleep_sec = (monday_midnight - now).total_seconds()
+    print(
+        f"💤 Weekend detected ({now.strftime('%A %H:%M ET')}) — "
+        f"sleeping {sleep_sec/3600:.1f}h until Monday 00:00 ET",
+        flush=True
+    )
+    await asyncio.sleep(sleep_sec)
+    print("⏰ Monday arrived — resuming websocket connection", flush=True)
+
 # ======================================================
 # DISCORD ALERTS
 # ======================================================
@@ -1964,6 +1988,11 @@ async def run_qct_scheduler(qct_tracker):
         now_et = datetime.now(ET)
         today = now_et.date()
 
+        # Skip weekends — no market activity, no reports
+        if today.weekday() >= 5:  # 5=Saturday, 6=Sunday
+            await asyncio.sleep(30)
+            continue
+
         # Reset flags on new trading day
         if last_report_date is not None and today > last_report_date:
             reported_330 = False
@@ -2609,6 +2638,7 @@ async def run(shared=None):
                         
         except websockets.exceptions.ConnectionClosed as e:
             print(f"⚠️ Websocket closed: {e}", flush=True)
+            await _weekend_sleep()  # no-op on weekdays
             print("🔁 Reconnecting in 5 seconds...", flush=True)
             await asyncio.sleep(5)
         except Exception as e:
@@ -2630,6 +2660,7 @@ async def run(shared=None):
                 import traceback
                 traceback.print_exc()
             
+            await _weekend_sleep()  # no-op on weekdays
             print("🔁 Reconnecting websocket in 5 seconds...", flush=True)
             await asyncio.sleep(5)
 
