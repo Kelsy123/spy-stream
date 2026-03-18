@@ -1824,7 +1824,7 @@ class QCTTracker:
             return 0.0
         return round((self.qct_volume / total) * 100, 4)
 
-    def build_report(self, label: str, official_volume: int = None) -> str:
+    def build_report(self, label: str, official_volume: int = None, clv: float = None) -> str:
         pct = self.get_pct(override_total=official_volume)
         now_str = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
 
@@ -1834,15 +1834,63 @@ class QCTTracker:
         else:
             volume_line = f"Total Daily Volume: **{self.total_volume:,}** shares *(streamed — may be incomplete)*"
 
-        # Contextual flag based on historically elevated levels
+        # Updated flag language — structural interpretation, direction depends on gamma regime
         if pct >= 5.0:
-            flag = "🚨 **ELEVATED** — historically preceded sharp sell-offs (e.g., 02-02: 5.33%, 02-10: 5.39%)"
+            flag = "🚨 **STRUCTURALLY DOMINANT** — dealer hedging heavily influencing price (direction depends on gamma regime)"
         elif pct >= 3.5:
-            flag = "⚠️ **NOTEWORTHY** — above average institutional hedging/unwinding activity"
+            flag = "⚠️ **ELEVATED STRUCTURAL FLOW** — options-driven inventory adjustment above norm"
         elif pct >= 2.0:
-            flag = "📊 **MODERATE** — within normal range, worth watching"
+            flag = "📊 **ACTIVE HEDGING** — within normal dealer management range"
         else:
-            flag = "✅ **LOW** — no unusual QCT activity"
+            flag = "✅ **LOW STRUCTURAL FLOW** — price discovery likely dominant"
+
+        # CLV block — only included in EOD report when official OHLC is available
+        clv_block = ""
+        if clv is not None:
+            # Auction close classification
+            if clv >= 0.7:
+                auction_label = "STRONG"
+            elif clv <= 0.3:
+                auction_label = "WEAK"
+            else:
+                auction_label = "NEUTRAL"
+
+            # Structural flow context combining QCT % and CLV
+            if pct >= 5.0:
+                if clv < 0.3:
+                    context = "Weak auction close under structurally dominant hedging"
+                elif clv > 0.7:
+                    context = "Strong auction close under structurally dominant hedging"
+                else:
+                    context = "Neutral auction close under structurally dominant hedging"
+            elif pct >= 3.5:
+                if clv < 0.3:
+                    context = "Weak auction close with elevated structural flow"
+                elif clv > 0.7:
+                    context = "Strong auction close with elevated structural flow"
+                else:
+                    context = "Balanced auction close with elevated structural flow"
+            elif pct >= 2.0:
+                if clv < 0.2:
+                    context = "Weak auction close during active hedging"
+                elif clv > 0.8:
+                    context = "Strong auction close during active hedging"
+                else:
+                    context = "Auction close within typical hedging conditions"
+            else:
+                if clv < 0.2:
+                    context = "Weak auction close with price discovery dominant"
+                elif clv > 0.8:
+                    context = "Strong auction close with price discovery dominant"
+                else:
+                    context = "Balanced auction close — price discovery dominant"
+
+            clv_block = (
+                f"\n─────────────────────────────\n"
+                f"Close Location (CLV): **{clv:.4f}**\n"
+                f"Auction Close: **{auction_label}**\n"
+                f"_{context}_"
+            )
 
         return (
             f"{'🔔' if 'Intraday' in label else '📋'} **QCT Report — {label}**\n"
@@ -1854,6 +1902,7 @@ class QCTTracker:
             f"QCT Trade Count: {self.qct_trades:,} | Total Trades: {self.total_trades:,}\n"
             f"─────────────────────────────\n"
             f"{flag}"
+            f"{clv_block}"
         )
 
 
@@ -1892,6 +1941,70 @@ async def fetch_official_daily_volume(symbol: str, api_key: str) -> int | None:
 
     except Exception as e:
         print(f"⚠️ fetch_official_daily_volume error: {e}", flush=True)
+        return None
+
+
+def compute_clv(close: float, low: float, high: float) -> float | None:
+    """
+    Close Location Value — where price closed within today's range.
+    Returns a value between 0.0 (closed at low) and 1.0 (closed at high).
+    Returns None if range is zero or inputs are invalid.
+    """
+    try:
+        rng = high - low
+        if rng <= 0:
+            return None
+        return round((close - low) / rng, 4)
+    except Exception:
+        return None
+
+
+async def fetch_official_open_close(symbol: str, api_key: str) -> dict | None:
+    """
+    Fetch today's official OHLC + volume from Massive's open-close endpoint.
+    Used by the 8:05 PM QCT report so CLV can be computed from official close/high/low.
+    Returns a dict with keys: open, high, low, close, volume — or None on failure.
+    """
+    try:
+        today = datetime.now(ET).date()
+        url = f"https://api.massive.com/v1/open-close/{symbol}/{today.isoformat()}"
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: requests.get(url, headers=headers, timeout=10)
+        )
+
+        if response.status_code != 200:
+            print(f"⚠️ fetch_official_open_close: API returned {response.status_code}: {response.text[:100]}", flush=True)
+            return None
+
+        data = response.json()
+        print(f"✅ fetch_official_open_close response: {data}", flush=True)
+
+        o = data.get("open",   data.get("o"))
+        h = data.get("high",   data.get("h"))
+        l = data.get("low",    data.get("l"))
+        c = data.get("close",  data.get("c"))
+        v = data.get("volume", data.get("v"))
+
+        if None in (o, h, l, c, v) or int(v) == 0:
+            print("⚠️ fetch_official_open_close: one or more OHLCV fields missing or zero", flush=True)
+            return None
+
+        result = {
+            "open":   float(o),
+            "high":   float(h),
+            "low":    float(l),
+            "close":  float(c),
+            "volume": int(v),
+        }
+        print(f"✅ Official OHLCV — O:{result['open']} H:{result['high']} L:{result['low']} C:{result['close']} V:{result['volume']:,}", flush=True)
+        return result
+
+    except Exception as e:
+        print(f"⚠️ fetch_official_open_close error: {e}", flush=True)
         return None
 
 
@@ -2008,11 +2121,24 @@ async def run_qct_scheduler(qct_tracker):
             reported_330 = True
             last_report_date = today
 
-        # 8:05 PM EOD report — fetch official volume from Massive API
+        # 8:05 PM EOD report — fetch official OHLC from Massive API, compute CLV
         if not reported_eod and t >= time(20, 5):
-            print("📊 Fetching official daily volume for QCT EOD report...", flush=True)
-            official_vol = await fetch_official_daily_volume(SYMBOL, MASSIVE_API_KEY)
-            report = qct_tracker.build_report("End-of-Day Summary", official_volume=official_vol)
+            print("📊 Fetching official OHLC for QCT EOD report...", flush=True)
+            ohlcv = await fetch_official_open_close(SYMBOL, MASSIVE_API_KEY)
+            official_vol = None
+            clv = None
+            if ohlcv is not None:
+                official_vol = ohlcv["volume"]
+                clv = compute_clv(ohlcv["close"], ohlcv["low"], ohlcv["high"])
+                if clv is not None:
+                    print(f"📐 CLV computed: {clv:.4f} (C={ohlcv['close']} L={ohlcv['low']} H={ohlcv['high']})", flush=True)
+                else:
+                    print("⚠️ CLV could not be computed (zero range?)", flush=True)
+            else:
+                # Fallback: try volume-only fetch so we still get the volume line
+                print("⚠️ OHLC fetch failed — falling back to volume-only fetch", flush=True)
+                official_vol = await fetch_official_daily_volume(SYMBOL, MASSIVE_API_KEY)
+            report = qct_tracker.build_report("End-of-Day Summary", official_volume=official_vol, clv=clv)
             print(f"\n{report}\n", flush=True)
             await send_discord(report)
             reported_eod = True
