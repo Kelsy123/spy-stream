@@ -86,6 +86,17 @@ ANCHOR_THRESHOLD = int(os.environ.get("ANCHOR_THRESHOLD", "1000"))        # Prin
 ANCHOR_PRICE_TOLERANCE = float(os.environ.get("ANCHOR_PRICE_TOLERANCE", "0.05"))  # +-$0.05 price bucket
 ANCHOR_COOLDOWN = int(os.environ.get("ANCHOR_COOLDOWN", "300"))           # 5 min cooldown per price level
 
+# Print velocity spike detection settings
+# Watches ALL zero-size prints for density spikes vs a rolling baseline.
+# Independent of AnchorDetector — no shared state, anchor is unaffected.
+VELOCITY_SPIKE_ENABLED = os.environ.get("VELOCITY_SPIKE_ENABLED", "true").lower() in ("true", "1", "yes")
+VELOCITY_SPIKE_WINDOW_SEC    = int(float(os.environ.get("VELOCITY_SPIKE_WINDOW_SEC",    "120")))   # 2-min detection window
+VELOCITY_SPIKE_BASELINE_SEC  = int(float(os.environ.get("VELOCITY_SPIKE_BASELINE_SEC",  "1800")))  # 30-min rolling baseline
+VELOCITY_SPIKE_MULTIPLIER    = float(os.environ.get("VELOCITY_SPIKE_MULTIPLIER",    "1.75"))       # fire if count > 1.75x baseline avg
+VELOCITY_SPIKE_MIN_BASELINE  = int(float(os.environ.get("VELOCITY_SPIKE_MIN_BASELINE",  "5")))    # need at least 5 completed windows before comparing
+VELOCITY_SPIKE_PRICE_GATE    = float(os.environ.get("VELOCITY_SPIKE_PRICE_GATE",    "0.15"))      # require $0.15 price move in window
+VELOCITY_SPIKE_COOLDOWN      = int(float(os.environ.get("VELOCITY_SPIKE_COOLDOWN",      "300")))  # 5 min cooldown between alerts
+
 # ======================================================
 # SIP CONDITION FILTERING
 # ======================================================
@@ -235,6 +246,131 @@ class AnchorDetector:
         dq = self._buckets[bucket]
         cutoff = ts_unix - ANCHOR_WINDOW_SEC
         return sum(1 for t in dq if t >= cutoff)
+
+
+
+
+# ======================================================
+# PRINT VELOCITY SPIKE DETECTOR
+# Watches ALL zero-size prints across any conditions.
+# Fires on the main Discord channel when a 2-min print
+# count exceeds 1.75x the rolling 30-min baseline AND
+# price moved ≥ $0.15 in that same window.
+# Completely independent of AnchorDetector — no shared
+# state, anchor priority at the open is unaffected.
+# ======================================================
+class PrintVelocitySpikeDetector:
+    """
+    Detects institutional velocity spikes in zero-size print flow.
+
+    Algorithm:
+      - Maintains a rolling deque of (unix_ts, price) for all zero-size prints.
+      - Every time a print arrives, counts how many prints fall in the most
+        recent VELOCITY_SPIKE_WINDOW_SEC (2 min) — this is the "current window."
+      - Computes the per-window average over the prior VELOCITY_SPIKE_BASELINE_SEC
+        (30 min), split into non-overlapping windows — this is the baseline.
+      - Fires if:
+          current_count > VELOCITY_SPIKE_MULTIPLIER * baseline_avg
+          AND price moved >= VELOCITY_SPIKE_PRICE_GATE in the current window.
+      - Then respects a VELOCITY_SPIKE_COOLDOWN before firing again.
+
+    Does NOT touch any CSV/JSON files.
+    Does NOT share any state with AnchorDetector or ZeroSizeTradeLogger.
+    """
+
+    def __init__(self):
+        # Rolling deque of (unix_ts: float, price: float) for all zero-size prints
+        self._prints: deque = deque()
+        # Unix timestamp of last alert fired (float)
+        self._last_alert_ts: float = 0.0
+
+    def feed(self, price: float, ts_unix: float) -> dict | None:
+        """
+        Call this for every zero-size trade (any conditions).
+        Returns an alert dict if a spike is detected, else None.
+
+        Alert dict keys:
+            current_count  — prints in current 2-min window
+            baseline_avg   — avg prints per 2-min window over prior 30 min
+            multiplier     — current_count / baseline_avg
+            price_move     — abs price swing inside the current window ($)
+            price_open     — first price in the current window
+            price_close    — latest price (this print)
+            direction      — "UP" | "DOWN"
+            window_sec     — VELOCITY_SPIKE_WINDOW_SEC
+        """
+        if not VELOCITY_SPIKE_ENABLED:
+            return None
+
+        self._prints.append((ts_unix, price))
+
+        # Evict anything older than baseline + current window
+        max_age = VELOCITY_SPIKE_BASELINE_SEC + VELOCITY_SPIKE_WINDOW_SEC
+        cutoff_all = ts_unix - max_age
+        while self._prints and self._prints[0][0] < cutoff_all:
+            self._prints.popleft()
+
+        # ── Current window ──────────────────────────────────────────────
+        window_start = ts_unix - VELOCITY_SPIKE_WINDOW_SEC
+        current_window_prints = [(t, p) for t, p in self._prints if t >= window_start]
+        current_count = len(current_window_prints)
+
+        if current_count == 0:
+            return None
+
+        # Price gate — swing within current window
+        prices_in_window = [p for _, p in current_window_prints]
+        price_open  = prices_in_window[0]
+        price_close = prices_in_window[-1]
+        price_move  = abs(price_close - price_open)
+
+        # ── Baseline: non-overlapping windows over the prior 30 min ────
+        baseline_end   = window_start          # baseline stops where current window starts
+        baseline_start = baseline_end - VELOCITY_SPIKE_BASELINE_SEC
+        baseline_prints = [(t, p) for t, p in self._prints if baseline_start <= t < baseline_end]
+
+        # Split baseline prints into non-overlapping VELOCITY_SPIKE_WINDOW_SEC buckets
+        num_baseline_windows = VELOCITY_SPIKE_BASELINE_SEC // VELOCITY_SPIKE_WINDOW_SEC
+        if num_baseline_windows < VELOCITY_SPIKE_MIN_BASELINE:
+            return None  # Not enough history yet
+
+        bucket_counts = [0] * num_baseline_windows
+        for t, _ in baseline_prints:
+            offset = t - baseline_start
+            idx = int(offset // VELOCITY_SPIKE_WINDOW_SEC)
+            if 0 <= idx < num_baseline_windows:
+                bucket_counts[idx] += 1
+
+        baseline_avg = sum(bucket_counts) / num_baseline_windows
+        if baseline_avg == 0:
+            return None  # Avoid divide-by-zero in completely flat periods
+
+        multiplier = current_count / baseline_avg
+
+        # ── Threshold checks ────────────────────────────────────────────
+        if multiplier < VELOCITY_SPIKE_MULTIPLIER:
+            return None
+        if price_move < VELOCITY_SPIKE_PRICE_GATE:
+            return None
+
+        # ── Cooldown ────────────────────────────────────────────────────
+        if ts_unix - self._last_alert_ts < VELOCITY_SPIKE_COOLDOWN:
+            return None
+
+        self._last_alert_ts = ts_unix
+
+        direction = "UP" if price_close > price_open else "DOWN"
+
+        return {
+            "current_count":  current_count,
+            "baseline_avg":   round(baseline_avg, 1),
+            "multiplier":     round(multiplier, 2),
+            "price_move":     round(price_move, 2),
+            "price_open":     price_open,
+            "price_close":    price_close,
+            "direction":      direction,
+            "window_sec":     VELOCITY_SPIKE_WINDOW_SEC,
+        }
 
 
 # ======================================================
@@ -2187,6 +2323,18 @@ async def run(shared=None):
         print(f"⚓ Anchor detector ENABLED — threshold={ANCHOR_THRESHOLD} prints / {ANCHOR_WINDOW_SEC}s window, tolerance=±${ANCHOR_PRICE_TOLERANCE}", flush=True)
     else:
         print("⏸️ Anchor detector DISABLED", flush=True)
+
+    # Initialize print velocity spike detector (independent of all other trackers)
+    velocity_spike_detector = PrintVelocitySpikeDetector()
+    if VELOCITY_SPIKE_ENABLED:
+        print(
+            f"📈 Print velocity spike detector ENABLED — "
+            f"{VELOCITY_SPIKE_WINDOW_SEC}s window, {VELOCITY_SPIKE_MULTIPLIER}x threshold, "
+            f"${VELOCITY_SPIKE_PRICE_GATE} price gate, {VELOCITY_SPIKE_COOLDOWN}s cooldown",
+            flush=True
+        )
+    else:
+        print("⏸️ Print velocity spike detector DISABLED", flush=True)
     
     # Initialize dark pool tracker
     dark_pool_tracker = DarkPoolTracker(SYMBOL, DARK_POOL_SIZE_THRESHOLD)
@@ -2408,6 +2556,32 @@ async def run(shared=None):
                                 )
                                 print(f"⚓ ANCHOR DETECTED ${triggered_bucket:.2f} — {count:,} prints in {ANCHOR_WINDOW_SEC}s", flush=True)
                                 await send_discord_anchor(anchor_msg)  # await directly — guaranteed delivery before processing continues
+
+                        # ── PRINT VELOCITY SPIKE DETECTOR ───────────────────────────────
+                        # Runs on ALL zero-size trades, any conditions.
+                        # Fires to main Discord when print density > 1.75x baseline
+                        # AND price moved >= $0.15 in the same 2-min window.
+                        # No shared state with AnchorDetector.
+                        if size == 0 and VELOCITY_SPIKE_ENABLED:
+                            ts_unix_vs = sip_ts_raw / 1000.0
+                            spike = velocity_spike_detector.feed(price, ts_unix_vs)
+                            if spike is not None:
+                                now_str_vs = datetime.fromtimestamp(ts_unix_vs, tz=ET).strftime("%H:%M:%S ET")
+                                direction_arrow = "📈" if spike["direction"] == "UP" else "📉"
+                                spike_msg = (
+                                    f"{direction_arrow} **INSTITUTIONAL VELOCITY SPIKE** ({now_str_vs})\n"
+                                    f"`{spike['current_count']:,} prints in {spike['window_sec']}s  "
+                                    f"({spike['multiplier']:.2f}x baseline of {spike['baseline_avg']:.0f})`\n"
+                                    f"Price: **${spike['price_open']:.2f} → ${spike['price_close']:.2f}** "
+                                    f"({spike['direction']}, Δ${spike['price_move']:.2f})"
+                                )
+                                print(
+                                    f"📈 VELOCITY SPIKE {now_str_vs} — "
+                                    f"{spike['current_count']:,} prints ({spike['multiplier']:.2f}x) "
+                                    f"${spike['price_open']:.2f}→${spike['price_close']:.2f} Δ${spike['price_move']:.2f}",
+                                    flush=True
+                                )
+                                asyncio.create_task(send_discord(spike_msg))
 
                         # Update session-specific categories FIRST (needed for categorization)
                         in_premarket = time(4, 0) <= tm < time(9, 30)
@@ -2856,3 +3030,4 @@ if __name__ == "__main__":
         print("❌ Fatal crash:", e, flush=True)
         traceback.print_exc()
         raise
+
