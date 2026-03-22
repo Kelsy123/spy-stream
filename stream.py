@@ -2220,7 +2220,7 @@ async def fetch_today_range(symbol: str, api_key: str) -> tuple[float, float] | 
         return None
 
 
-async def run_qct_scheduler(qct_tracker):
+async def run_qct_scheduler(qct_tracker, shared=None):
     """
     Separate coroutine — runs alongside the main websocket loop via asyncio.gather.
     3:30 PM ET: intraday check using streamed volume.
@@ -2279,6 +2279,23 @@ async def run_qct_scheduler(qct_tracker):
             await send_discord(report)
             reported_eod = True
             last_report_date = today
+
+            # ── EOD summaries for zero-size, dark pool, phantom ──────────
+            _zero_logger       = shared.get("zero_logger")       if shared else None
+            _dark_pool_tracker = shared.get("dark_pool_tracker") if shared else None
+            _phantom_tracker   = shared.get("phantom_tracker")   if shared else None
+
+            if _zero_logger and _zero_logger.zero_trades:
+                print("📎 Sending zero-size EOD summary + CSV...", flush=True)
+                await _zero_logger.save_summary()
+
+            if _dark_pool_tracker and _dark_pool_tracker.dark_pool_prints:
+                print("🟣 Sending dark pool EOD summary...", flush=True)
+                await _dark_pool_tracker.save_summary()
+
+            if _phantom_tracker and _phantom_tracker.phantom_prints:
+                print("👻 Sending phantom EOD summary...", flush=True)
+                await _phantom_tracker.save_summary()
 
         # Sleep 30 seconds between checks — lightweight
         await asyncio.sleep(30)
@@ -2348,6 +2365,9 @@ async def run(shared=None):
     qct_tracker = QCTTracker(SYMBOL)
     if shared is not None:
         shared["qct_tracker"] = qct_tracker
+        shared["zero_logger"] = zero_logger
+        shared["dark_pool_tracker"] = dark_pool_tracker
+        shared["phantom_tracker"] = phantom_tracker
 
     # Session ranges
     today_low = None
@@ -2984,7 +3004,7 @@ if __name__ == "__main__":
         # Wait until run() has initialized qct_tracker
         while "qct_tracker" not in shared:
             await asyncio.sleep(0.5)
-        await run_qct_scheduler(shared["qct_tracker"])
+        await run_qct_scheduler(shared["qct_tracker"], shared=shared)
     
     # Global references for signal handler
     global_zero_logger = None
