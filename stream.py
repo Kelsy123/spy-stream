@@ -2523,12 +2523,14 @@ async def run(shared=None):
                             last_today_range_poll = now_poll
                             api_low, api_high = await fetch_today_range(SYMBOL, MASSIVE_API_KEY)
                             if api_low is not None and api_high is not None:
-                                # Only correct downward/upward if API is more conservative than current
-                                # (i.e. reset contaminated extremes, don't override genuine moves)
-                                if today_low is None or api_low > today_low:
-                                    today_low = api_low
-                                if today_high is None or api_high < today_high:
-                                    today_high = api_high
+                                # Always trust the API as the authoritative range.
+                                # This handles both directions:
+                                #   - Expands range OUT if pre-market/session moved beyond the seed
+                                #   - Pulls range IN if phantoms contaminated it (corrects inflated extremes)
+                                # The range guard still blocks intra-poll phantom contamination from
+                                # individual trades between poll cycles.
+                                today_low = api_low
+                                today_high = api_high
 
                         # ====================================================================
                         # ZERO-SIZE TRADE DETECTION
@@ -2684,13 +2686,19 @@ async def run(shared=None):
                         # Before warmup (first 100 trades) let everything through — phantom
                         # detection handles out-of-range prices during that window.
                         if (initial_trades_count >= INITIAL_TRADES_THRESHOLD and
-                                today_low is not None and today_high is not None):
+                                today_low is not None and today_high is not None and
+                                not in_premarket):
+                            # Range guard only applies during RTH and after-hours, not pre-market.
+                            # Pre-market can make large legitimate moves (e.g. gap-up/down on news)
+                            # that would be wrongly blocked by the $0.25 intra-poll guard.
+                            # The API poll already corrects the range every 5 min, so pre-market
+                            # contamination is bounded to at most one poll interval.
                             range_safe = (
                                 price >= today_low - PHANTOM_GAP_FROM_CURRENT and
                                 price <= today_high + PHANTOM_GAP_FROM_CURRENT
                             )
                         else:
-                            range_safe = True  # Warmup or range not established — let through
+                            range_safe = True  # Warmup, range not established, or pre-market — let through
 
                         if range_safe and not is_phantom and is_real_trade:
                             # Update today's full session range
