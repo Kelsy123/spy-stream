@@ -714,46 +714,16 @@ CSV:  {self.get_csv_file()}
             print(f"⚠️ CSV Discord upload error: {e}", flush=True)
 
     async def save_summary(self):
-        """Save daily summary to file, send text summary + CSV attachment to Discord"""
+        """Save daily summary to file and upload CSV to Discord (no text summary — CSV is the record)."""
         summary = self.get_daily_summary()
         summary_file = self.log_dir / f"summary_{self.ticker}_{self.get_today_str()}.txt"
         with open(summary_file, 'w') as f:
             f.write(summary)
         print(summary, flush=True)
-        
-        # Send summary to Discord if we have any zero trades
-        if self.zero_trades:
-            discord_msg = f"📊 **Zero-Size Trade Summary - {self.ticker}**\n```\n"
-            discord_msg += f"Total: {len(self.zero_trades)} zero-size trades detected today\n"
-            discord_msg += f"Price Range: ${min(t['price'] for t in self.zero_trades):.2f} - ${max(t['price'] for t in self.zero_trades):.2f}\n"
-            
-            # Show top 3 repeated levels
-            price_counts = defaultdict(int)
-            for trade in self.zero_trades:
-                price_counts[trade['price']] += 1
-            repeated = {p: c for p, c in price_counts.items() if c > 1}
-            
-            if repeated:
-                discord_msg += f"\nRepeated Levels:\n"
-                for price, count in sorted(repeated.items(), key=lambda x: x[1], reverse=True)[:3]:
-                    discord_msg += f"  ${price:.2f}: {count}x\n"
-            
-            # List individual trades
-            discord_msg += f"\nIndividual Trades:\n"
-            discord_msg += f"{'#':<4} {'Time':<12} {'Price':<10} {'Exchange':<15}\n"
-            discord_msg += f"{'-'*45}\n"
-            
-            for i, trade in enumerate(self.zero_trades, 1):
-                # Truncate exchange name if too long
-                exch_name = trade['exchange_name'][:14]
-                discord_msg += f"{i:<4} {trade['time_est']:<12} ${trade['price']:<9.2f} {exch_name:<15}\n"
-            
-            discord_msg += "```"
-            await send_discord_zero(discord_msg)
 
-            # Upload the CSV as a file attachment
-            await self.send_csv_to_discord()
-        
+        # Upload CSV only — no text summary message (file is too large to enumerate in Discord)
+        await self.send_csv_to_discord()
+
         return summary_file
 
 # ======================================================
@@ -2297,6 +2267,15 @@ async def run_qct_scheduler(qct_tracker, shared=None):
                 print("👻 Sending phantom EOD summary...", flush=True)
                 await _phantom_tracker.save_summary()
 
+            # Clear in-memory lists after all EOD sends complete
+            if _zero_logger:
+                _zero_logger.zero_trades.clear()
+            if _dark_pool_tracker:
+                _dark_pool_tracker.dark_pool_prints.clear()
+            if _phantom_tracker:
+                _phantom_tracker.phantom_prints.clear()
+            print("🧹 In-memory trade lists cleared for new day.", flush=True)
+
         # Sleep 30 seconds between checks — lightweight
         await asyncio.sleep(30)
 
@@ -2477,27 +2456,9 @@ async def run(shared=None):
                         is_after_close = tm >= time(20, 0)  # After 8 PM ET
                         
                         if is_after_close and not summary_generated_today and (last_summary_date is None or last_summary_date < current_date):
-                            # Check if today was a trading day (not weekend/holiday)
-                            is_holiday = await is_market_holiday()
-                            
-                            if not is_holiday:
-                                # Generate zero-size summary
-                                if zero_logger and zero_logger.zero_trades:
-                                    print("🕐 Market closed. Generating zero-size trade summary...", flush=True)
-                                    await zero_logger.save_summary()
-                                
-                                # Generate dark pool summary
-                                if dark_pool_tracker.dark_pool_prints:
-                                    print("🕐 Market closed. Generating dark pool summary...", flush=True)
-                                    await dark_pool_tracker.save_summary()
-                                
-                                # Generate phantom print summary
-                                if phantom_tracker.phantom_prints:
-                                    print("🕐 Market closed. Generating phantom print summary...", flush=True)
-                                    await phantom_tracker.save_summary()
-                            else:
-                                print("📅 Skipping summaries - market was closed today (weekend/holiday)", flush=True)
-                            
+                            # EOD summaries and CSV uploads are handled by run_qct_scheduler at 8:05 PM.
+                            # This block only marks the flag and clears memory so yesterday's data
+                            # doesn't bleed into tomorrow — it no longer duplicates the sends.
                             summary_generated_today = True
                             last_summary_date = current_date
 
