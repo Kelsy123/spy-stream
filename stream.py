@@ -2456,18 +2456,12 @@ async def run(shared=None):
                         is_after_close = tm >= time(20, 0)  # After 8 PM ET
                         
                         if is_after_close and not summary_generated_today and (last_summary_date is None or last_summary_date < current_date):
-                            # EOD summaries and CSV uploads are handled by run_qct_scheduler at 8:05 PM.
-                            # This block only marks the flag and clears memory so yesterday's data
-                            # doesn't bleed into tomorrow — it no longer duplicates the sends.
+                            # EOD summaries, CSV uploads, and memory clears are all handled by
+                            # run_qct_scheduler at 8:05 PM. This block only sets the flag so the
+                            # main loop doesn't keep re-entering here on every post-8PM trade.
+                            # Do NOT clear in-memory lists here — the scheduler needs them intact.
                             summary_generated_today = True
                             last_summary_date = current_date
-
-                            # Clear in-memory lists so yesterday's data doesn't bleed into tomorrow's summary
-                            if zero_logger:
-                                zero_logger.zero_trades.clear()
-                            dark_pool_tracker.dark_pool_prints.clear()
-                            phantom_tracker.phantom_prints.clear()
-                            print("🧹 In-memory trade lists cleared for new day.", flush=True)
                         
                         # Reset flag for new day
                         if last_summary_date is not None and current_date > last_summary_date:
