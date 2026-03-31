@@ -719,7 +719,13 @@ CSV:  {self.get_csv_file()}
         summary_file = self.log_dir / f"summary_{self.ticker}_{self.get_today_str()}.txt"
         with open(summary_file, 'w') as f:
             f.write(summary)
-        print(summary, flush=True)
+        # Print only a short confirmation — full summary saved to file above.
+        # Printing the full summary floods Railway logs (500 logs/sec limit) and
+        # causes messages to be dropped before the CSV upload can complete.
+        print(
+            f"📊 Zero-size EOD summary saved: {len(self.zero_trades):,} trades → {summary_file.name}",
+            flush=True
+        )
 
         # Upload CSV only — no text summary message (file is too large to enumerate in Discord)
         await self.send_csv_to_discord()
