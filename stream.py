@@ -1103,18 +1103,56 @@ TOP PRINTS BY NOTIONAL VALUE
         )
         await send_discord(msg)
     
+    async def send_csv_to_discord(self):
+        """Upload today's dark pool CSV file as a Discord attachment to the main channel."""
+        csv_file = self.get_csv_file()
+        if not csv_file.exists():
+            await send_discord("📎 Dark pool CSV not found — no prints were written today.")
+            return
+
+        try:
+            with open(csv_file, 'rb') as f:
+                csv_bytes = f.read()
+
+            filename = csv_file.name
+            form = aiohttp.FormData()
+            form.add_field(
+                'payload_json',
+                json.dumps({"content": f"📎 **Dark Pool Trade Log — {self.ticker} {self.get_today_str()}**"}),
+                content_type='application/json'
+            )
+            form.add_field(
+                'file',
+                csv_bytes,
+                filename=filename,
+                content_type='text/csv'
+            )
+
+            async with aiohttp.ClientSession() as session:
+                resp = await session.post(DISCORD_WEBHOOK_URL, data=form)
+                if resp.status in (200, 204):
+                    print(f"📎 Dark pool CSV uploaded to Discord: {filename}", flush=True)
+                else:
+                    text = await resp.text()
+                    print(f"⚠️ Dark pool CSV Discord upload failed ({resp.status}): {text}", flush=True)
+        except Exception as e:
+            print(f"⚠️ Dark pool CSV Discord upload error: {e}", flush=True)
+
     async def save_summary(self):
-        """Save daily summary to file and send to Discord"""
+        """Save daily summary to file, send Discord text summary, and upload CSV."""
         summary = self.get_daily_summary()
         summary_file = self.log_dir / f"summary_dark_pool_{self.ticker}_{self.get_today_str()}.txt"
         with open(summary_file, 'w') as f:
             f.write(summary)
         print(summary, flush=True)
         
-        # Send to Discord
+        # Send text summary to Discord
         discord_msg = self.get_discord_summary()
         if discord_msg:
             await send_discord(discord_msg)
+
+        # Also upload the full CSV as an attachment
+        await self.send_csv_to_discord()
         
         return summary_file
 
@@ -1282,13 +1320,17 @@ ALL PHANTOM PRINTS (Chronological Order)
         msg += f"• Total Prints: **{len(self.phantom_prints)}**\n"
         msg += f"• Price Range: **${min(p['price'] for p in self.phantom_prints):.2f} - ${max(p['price'] for p in self.phantom_prints):.2f}**\n\n"
         
-        msg += f"**All Prints (Chronological):**\n```\n"
+        display_prints = self.phantom_prints[:40]
+        overflow = len(self.phantom_prints) - len(display_prints)
+        msg += f"**All Prints (Chronological, showing {len(display_prints)} of {len(self.phantom_prints)}):**\n```\n"
         msg += f"{'#':<4} {'Time':<9} {'Price':<8} {'Size':<10}\n"
         msg += f"{'-'*35}\n"
         
-        for i, p in enumerate(self.phantom_prints, 1):
+        for i, p in enumerate(display_prints, 1):
             msg += f"{i:<4} {p['time_est'][:8]:<9} ${p['price']:<7.2f} {p['size']:>9,}\n"
         
+        if overflow > 0:
+            msg += f"  … +{overflow} more (see EOD CSV)\n"
         msg += "```"
         
         return msg
@@ -2838,6 +2880,57 @@ async def run(shared=None):
                                             f"Sharp reversal often follows."
                                         )
                                         asyncio.create_task(send_discord(acc_msg))
+
+                        # ====================================================================
+                        # QCT-AS-PHANTOM DETECTION
+                        # Trades with conditions [41, 52, 53] are QCT and excluded from
+                        # normal phantom detection, but if they're outside both the previous
+                        # AND current range they deserve a special alert.
+                        # ====================================================================
+                        QCT_CONDITIONS = frozenset([41, 52, 53])
+                        is_qct_only = set(conds) == QCT_CONDITIONS
+                        if (is_qct_only and exch == 4 and size > 0 and
+                                outside_prev and
+                                initial_trades_count >= INITIAL_TRADES_THRESHOLD and
+                                compare_high is not None and compare_low is not None and
+                                (price > compare_high + PHANTOM_GAP_FROM_CURRENT or
+                                 price < compare_low - PHANTOM_GAP_FROM_CURRENT)):
+                            qct_distance = min(
+                                abs(price - compare_high),
+                                abs(price - compare_low)
+                            )
+                            now_str_qct = datetime.now(ET).strftime("%H:%M:%S ET")
+                            print(
+                                f"🟠 QCT-AS-PHANTOM {ts_str()} ${price} "
+                                f"size={size} conds={conds} exch={exch} seq={sequence} "
+                                f"distance=${qct_distance:.2f} from current range "
+                                f"prev=[{prev_low},{prev_high}] current=[{compare_low},{compare_high}]",
+                                flush=True
+                            )
+                            qct_phantom_msg = (
+                                f"🟠 **{SYMBOL} Qualified Contingent Trade as Phantom Print Detected** ({now_str_qct})\n"
+                                f"Price: **${price}**  |  Size: {size:,}  |  Exch: {exch}\n"
+                                f"Conditions: [41, 52, 53] — QCT / Contingent / TTE\n"
+                                f"Distance from current range: **${qct_distance:.2f}**\n"
+                                f"Prev range: [{prev_low}, {prev_high}]  |  "
+                                f"Current range: [{compare_low}, {compare_high}]\n"
+                                f"Sequence: {sequence}  |  TRF ID: {trf_id}"
+                            )
+                            asyncio.create_task(send_discord(qct_phantom_msg))
+
+                            # Log to phantom tracker so it appears in EOD summary and CSV
+                            qct_phantom_trade_data = {
+                                'price': price,
+                                'size': size,
+                                'exchange': exch,
+                                'conditions': conds,
+                                'sequence': sequence,
+                                'sip_timestamp': sip_ts_raw,
+                                'trf_timestamp': trf_ts_raw,
+                                'trf_id': trf_id
+                            }
+                            qct_phantom_record = phantom_tracker.log_phantom_print(qct_phantom_trade_data, qct_distance)
+                            asyncio.create_task(phantom_tracker.queue_for_alert(qct_phantom_record))
 
                         # Phantom alert handling (is_phantom was already calculated earlier before range updates)
                         if is_phantom:
