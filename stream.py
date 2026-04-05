@@ -2593,15 +2593,22 @@ async def run(shared=None):
                             if spike is not None:
                                 now_str_vs = datetime.fromtimestamp(ts_unix_vs, tz=ET).strftime("%H:%M:%S ET")
                                 direction_arrow = "📈" if spike["direction"] == "UP" else "📉"
+                                is_major_spike = spike["current_count"] >= 2000
+                                if is_major_spike:
+                                    # High-visibility formatting for 2k+ spikes
+                                    header = f"🚨🚨 {direction_arrow} **‼️ MAJOR INSTITUTIONAL VELOCITY SPIKE ‼️** {direction_arrow} 🚨🚨"
+                                    count_line = f"**`{spike['current_count']:,} prints in {spike['window_sec']}s  ({spike['multiplier']:.2f}x baseline of {spike['baseline_avg']:.0f})`**"
+                                else:
+                                    header = f"{direction_arrow} **INSTITUTIONAL VELOCITY SPIKE**"
+                                    count_line = f"`{spike['current_count']:,} prints in {spike['window_sec']}s  ({spike['multiplier']:.2f}x baseline of {spike['baseline_avg']:.0f})`"
                                 spike_msg = (
-                                    f"{direction_arrow} **INSTITUTIONAL VELOCITY SPIKE** ({now_str_vs})\n"
-                                    f"`{spike['current_count']:,} prints in {spike['window_sec']}s  "
-                                    f"({spike['multiplier']:.2f}x baseline of {spike['baseline_avg']:.0f})`\n"
+                                    f"{header} ({now_str_vs})\n"
+                                    f"{count_line}\n"
                                     f"Price: **${spike['price_open']:.2f} → ${spike['price_close']:.2f}** "
                                     f"({spike['direction']}, Δ${spike['price_move']:.2f})"
                                 )
                                 print(
-                                    f"📈 VELOCITY SPIKE {now_str_vs} — "
+                                    f"{'🚨' if is_major_spike else '📈'} VELOCITY SPIKE {now_str_vs} — "
                                     f"{spike['current_count']:,} prints ({spike['multiplier']:.2f}x) "
                                     f"${spike['price_open']:.2f}→${spike['price_close']:.2f} Δ${spike['price_move']:.2f}",
                                     flush=True
@@ -2918,19 +2925,21 @@ async def run(shared=None):
                             )
                             asyncio.create_task(send_discord(qct_phantom_msg))
 
-                            # Log to phantom tracker so it appears in EOD summary and CSV
-                            qct_phantom_trade_data = {
-                                'price': price,
-                                'size': size,
-                                'exchange': exch,
-                                'conditions': conds,
-                                'sequence': sequence,
-                                'sip_timestamp': sip_ts_raw,
-                                'trf_timestamp': trf_ts_raw,
-                                'trf_id': trf_id
-                            }
-                            qct_phantom_record = phantom_tracker.log_phantom_print(qct_phantom_trade_data, qct_distance)
-                            asyncio.create_task(phantom_tracker.queue_for_alert(qct_phantom_record))
+                            # Log to phantom tracker so it appears in EOD summary and CSV.
+                            # Skip during the 4:00–4:05 AM overnight carryover flush window.
+                            if not (time(4, 0) <= tm < time(4, 5)):
+                                qct_phantom_trade_data = {
+                                    'price': price,
+                                    'size': size,
+                                    'exchange': exch,
+                                    'conditions': conds,
+                                    'sequence': sequence,
+                                    'sip_timestamp': sip_ts_raw,
+                                    'trf_timestamp': trf_ts_raw,
+                                    'trf_id': trf_id
+                                }
+                                qct_phantom_record = phantom_tracker.log_phantom_print(qct_phantom_trade_data, qct_distance)
+                                asyncio.create_task(phantom_tracker.queue_for_alert(qct_phantom_record))
 
                         # Phantom alert handling (is_phantom was already calculated earlier before range updates)
                         if is_phantom:
@@ -2939,31 +2948,62 @@ async def run(shared=None):
                                 abs(price - compare_high) if compare_high else float('inf'),
                                 abs(price - compare_low) if compare_low else float('inf')
                             )
-                            
-                            print(
-                                f"🚨🚨 PHANTOM PRINT {ts_str()} ${price} "
-                                f"size={size} conds={conds} exch={exch} seq={sequence} "
-                                f"distance=${distance:.2f} from current range "
-                                f"prev=[{prev_low},{prev_high}] current=[{compare_low},{compare_high}]",
-                                flush=True
-                            )
-                            
-                            # LOG TO PHANTOM TRACKER
-                            phantom_trade_data = {
-                                'price': price,
-                                'size': size,
-                                'exchange': exch,
-                                'conditions': conds,
-                                'sequence': sequence,
-                                'sip_timestamp': sip_ts_raw,
-                                'trf_timestamp': trf_ts_raw,
-                                'trf_id': trf_id
-                            }
-                            phantom_record = phantom_tracker.log_phantom_print(phantom_trade_data, distance)
 
-                            # BATCHED DISCORD ALERT — groups bursts into one message
-                            # (replaces per-print fire that caused thousands of pings at 8AM)
-                            asyncio.create_task(phantom_tracker.queue_for_alert(phantom_record))
+                            # Detect overnight carryover flush window (4:00–4:05 AM ET).
+                            # At 4:00 AM the SIP flushes prior overnight session prints at
+                            # overnight prices — they trigger phantom criteria but aren't
+                            # actionable intraday prints. Alert with a different label and
+                            # skip logging to the phantom tracker so the EOD summary stays clean.
+                            is_overnight_carryover = time(4, 0) <= tm < time(4, 5)
+
+                            if is_overnight_carryover:
+                                print(
+                                    f"🌙 OVERNIGHT CARRYOVER PRINT {ts_str()} ${price} "
+                                    f"size={size} conds={conds} exch={exch} seq={sequence} "
+                                    f"distance=${distance:.2f} — skipping phantom log",
+                                    flush=True
+                                )
+                                overnight_msg = (
+                                    f"🌙 **{SYMBOL} Overnight Carryover Print** ({tm.strftime('%H:%M:%S ET')})\n"
+                                    f"Price: **${price}**  |  Size: {size:,}  |  Exch: {exch}\n"
+                                    f"Conditions: {conds}\n"
+                                    f"Distance from range: **${distance:.2f}**  |  Sequence: {sequence}\n"
+                                    f"_Prior session print flushed at 4 AM open — not logged to phantom tracker_"
+                                )
+                                asyncio.create_task(phantom_tracker.queue_for_alert(
+                                    {'price': price, 'size': size, 'exchange': exch,
+                                     'conditions': conds, 'sequence': sequence,
+                                     'sip_timestamp': sip_ts_raw, 'trf_timestamp': trf_ts_raw,
+                                     'trf_id': trf_id, 'distance': distance,
+                                     'time_est': datetime.fromtimestamp(sip_ts_raw/1000, tz=ET).strftime('%H:%M:%S.%f')[:-3],
+                                     'timestamp_ms': sip_ts_raw, 'timestamp': datetime.fromtimestamp(sip_ts_raw/1000, tz=ET).isoformat()}
+                                ))
+                                asyncio.create_task(send_discord(overnight_msg))
+                            else:
+                                print(
+                                    f"🚨🚨 PHANTOM PRINT {ts_str()} ${price} "
+                                    f"size={size} conds={conds} exch={exch} seq={sequence} "
+                                    f"distance=${distance:.2f} from current range "
+                                    f"prev=[{prev_low},{prev_high}] current=[{compare_low},{compare_high}]",
+                                    flush=True
+                                )
+
+                                # LOG TO PHANTOM TRACKER
+                                phantom_trade_data = {
+                                    'price': price,
+                                    'size': size,
+                                    'exchange': exch,
+                                    'conditions': conds,
+                                    'sequence': sequence,
+                                    'sip_timestamp': sip_ts_raw,
+                                    'trf_timestamp': trf_ts_raw,
+                                    'trf_id': trf_id
+                                }
+                                phantom_record = phantom_tracker.log_phantom_print(phantom_trade_data, distance)
+
+                                # BATCHED DISCORD ALERT — groups bursts into one message
+                                # (replaces per-print fire that caused thousands of pings at 8AM)
+                                asyncio.create_task(phantom_tracker.queue_for_alert(phantom_record))
                             
                             # INSERT INTO POSTGRES (with connection check)
                             try:
