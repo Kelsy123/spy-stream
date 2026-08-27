@@ -23,6 +23,8 @@ POSTGRES_URL = os.environ["POSTGRES_URL"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 DISCORD_ZERO_WEBHOOK_URL = os.environ["DISCORD_ZERO_WEBHOOK_URL"]  # Separate channel for zero-size trade alerts
 DISCORD_ANCHOR_WEBHOOK_URL = os.environ.get("DISCORD_ANCHOR_WEBHOOK_URL", "")  # High-priority anchor formation alerts
+DISCORD_VELOCITY_SPIKE_WEBHOOK_URL = os.environ.get("DISCORD_VELOCITY_SPIKE_WEBHOOK_URL", "")  # Dedicated velocity spike channel (9:25 AM – 4:15 PM ET only)
+DISCORD_PHANTOM_WEBHOOK_URL = os.environ.get("DISCORD_PHANTOM_WEBHOOK_URL", "")  # Dedicated phantom print channel (duplicate of main)
 TRADIER_API_KEY = os.environ["TRADIER_API_KEY"]
 
 # Manual previous day range override (set in Railway environment variables)
@@ -177,6 +179,21 @@ async def send_discord_anchor(msg: str):
     Falls back to the main Discord channel if anchor webhook not configured."""
     url = DISCORD_ANCHOR_WEBHOOK_URL if DISCORD_ANCHOR_WEBHOOK_URL else DISCORD_WEBHOOK_URL
     await _send_with_retry(url, msg, "Discord-anchor")
+
+async def send_discord_velocity_spike(msg: str):
+    """Send to dedicated velocity spike channel. Only active 9:25 AM – 4:15 PM ET."""
+    if not DISCORD_VELOCITY_SPIKE_WEBHOOK_URL:
+        return
+    now_et = datetime.now(ET).time()
+    if not (time(9, 25) <= now_et <= time(16, 15)):
+        return
+    await _send_with_retry(DISCORD_VELOCITY_SPIKE_WEBHOOK_URL, msg, "Discord-velocity-spike")
+
+async def send_discord_phantom(msg: str):
+    """Send to dedicated phantom print channel (duplicate of main channel phantom alerts)."""
+    if not DISCORD_PHANTOM_WEBHOOK_URL:
+        return
+    await _send_with_retry(DISCORD_PHANTOM_WEBHOOK_URL, msg, "Discord-phantom")
 
 # ======================================================
 # ANCHOR DETECTOR
@@ -822,8 +839,6 @@ class DarkPoolTracker:
         
         # Return the complete record for batching
         return trade_record
-        
-        return trade_record
     
     def write_to_csv(self, record):
         """Append record to CSV file"""
@@ -1413,6 +1428,7 @@ ALL PHANTOM PRINTS (Chronological Order)
                 )
 
             asyncio.create_task(send_discord(msg))
+            asyncio.create_task(send_discord_phantom(msg))  # duplicate to phantom channel
 
         except asyncio.CancelledError:
             pass  # Normal — new phantom restarted the timer
@@ -2201,41 +2217,6 @@ async def fetch_today_range(symbol: str, api_key: str) -> tuple[float, float] | 
     except Exception as e:
         print(f"⚠️ fetch_today_range error: {e}", flush=True)
         return None, None
-    """
-    Fetch today's official total volume from Massive REST API.
-    Uses /v1/open-close/{symbol}/{date} endpoint.
-    Uses requests (sync) via executor — same pattern as other working Massive REST calls.
-    Returns volume as int, or None if the call fails.
-    """
-    try:
-        today = datetime.now(ET).date()
-        url = f"https://api.massive.com/v1/open-close/{symbol}/{today.isoformat()}"
-        headers = {"Authorization": f"Bearer {api_key}"}
-
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: requests.get(url, headers=headers, timeout=10)
-        )
-
-        if response.status_code != 200:
-            print(f"⚠️ Massive open-close API returned {response.status_code}: {response.text[:100]}", flush=True)
-            return None
-
-        data = response.json()
-        print(f"✅ Massive open-close response: {data}", flush=True)
-
-        vol = int(data.get("volume", data.get("v", 0)))
-        if vol == 0:
-            print("⚠️ Volume field was 0 or missing in open-close response", flush=True)
-            return None
-
-        print(f"✅ Official daily volume from Massive: {vol:,}", flush=True)
-        return vol
-
-    except Exception as e:
-        print(f"⚠️ fetch_official_daily_volume error: {e}", flush=True)
-        return None
 
 
 async def run_qct_scheduler(qct_tracker, shared=None):
@@ -2614,6 +2595,7 @@ async def run(shared=None):
                                     flush=True
                                 )
                                 asyncio.create_task(send_discord(spike_msg))
+                                asyncio.create_task(send_discord_velocity_spike(spike_msg))  # duplicate to velocity spike channel (9:25 AM – 4:15 PM ET only)
 
                         # Update session-specific categories FIRST (needed for categorization)
                         in_premarket = time(4, 0) <= tm < time(9, 30)
@@ -2924,6 +2906,7 @@ async def run(shared=None):
                                 f"Sequence: {sequence}  |  TRF ID: {trf_id}"
                             )
                             asyncio.create_task(send_discord(qct_phantom_msg))
+                            asyncio.create_task(send_discord_phantom(qct_phantom_msg))  # duplicate to phantom channel
 
                             # Log to phantom tracker so it appears in EOD summary and CSV.
                             # Skip during the 4:00–4:05 AM overnight carryover flush window.
@@ -2979,6 +2962,7 @@ async def run(shared=None):
                                      'timestamp_ms': sip_ts_raw, 'timestamp': datetime.fromtimestamp(sip_ts_raw/1000, tz=ET).isoformat()}
                                 ))
                                 asyncio.create_task(send_discord(overnight_msg))
+                                # NOTE: Overnight carryover alerts are NOT duplicated to the phantom channel
                             else:
                                 print(
                                     f"🚨🚨 PHANTOM PRINT {ts_str()} ${price} "
@@ -3152,4 +3136,3 @@ if __name__ == "__main__":
         print("❌ Fatal crash:", e, flush=True)
         traceback.print_exc()
         raise
-
