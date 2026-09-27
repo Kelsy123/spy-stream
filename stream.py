@@ -106,7 +106,7 @@ IGNORE_CONDITIONS = {
     0, 14, 4, 9, 19, 53, 1, 52
 }
 PHANTOM_RELEVANT_CONDITIONS = {
-    2, 3, 7, 8, 10, 12, 13, 15, 16, 17, 20, 21, 22, 25, 26, 28, 29, 30, 33, 34, 37, 41, 62
+    2, 3, 7, 8, 10, 12, 13, 15, 16, 17, 20, 21, 22, 25, 26, 28, 29, 30, 33, 34, 35, 37, 41, 62
 }
 
 # ======================================================
@@ -2923,6 +2923,67 @@ async def run(shared=None):
                                 }
                                 qct_phantom_record = phantom_tracker.log_phantom_print(qct_phantom_trade_data, qct_distance)
                                 asyncio.create_task(phantom_tracker.queue_for_alert(qct_phantom_record))
+
+                        # ====================================================================
+                        # OPTION-RELATED QCT-AS-PHANTOM DETECTION
+                        # Condition 35 = Option-Related. Combos with 52/53 (+optional 41)
+                        # are institutional option-linked structures that bypass normal
+                        # phantom detection (52/53 are in IGNORE_CONDITIONS). Same gate
+                        # logic as QCT-as-phantom above.
+                        # ====================================================================
+                        OPTION_RELATED_QCT_COMBOS = (
+                            frozenset([52, 35]),        # Option-Related Contingent Trade
+                            frozenset([53, 35]),        # Option-Related QCT
+                            frozenset([52, 35, 41]),    # Option-Related QCT (w/ TTE)
+                            frozenset([53, 35, 41]),    # Option-Related QCT (w/ TTE)
+                        )
+                        is_option_related_qct = frozenset(conds) in OPTION_RELATED_QCT_COMBOS
+                        if (is_option_related_qct and exch == 4 and size > 0 and
+                                outside_prev and
+                                initial_trades_count >= INITIAL_TRADES_THRESHOLD and
+                                compare_high is not None and compare_low is not None and
+                                (price > compare_high + PHANTOM_GAP_FROM_CURRENT or
+                                 price < compare_low - PHANTOM_GAP_FROM_CURRENT)):
+                            orqct_distance = min(
+                                abs(price - compare_high),
+                                abs(price - compare_low)
+                            )
+                            now_str_orqct = datetime.now(ET).strftime("%H:%M:%S ET")
+                            conds_label = ','.join(str(c) for c in sorted(conds))
+                            print(
+                                f"🟡 OPTION-RELATED-QCT-AS-PHANTOM {ts_str()} ${price} "
+                                f"size={size} conds={conds} exch={exch} seq={sequence} "
+                                f"distance=${orqct_distance:.2f} from current range "
+                                f"prev=[{prev_low},{prev_high}] current=[{compare_low},{compare_high}]",
+                                flush=True
+                            )
+                            orqct_phantom_msg = (
+                                f"🟡 **{SYMBOL} Option-Related Qualified Contingent Trade as Phantom Print Detected** ({now_str_orqct})\n"
+                                f"Price: **${price}**  |  Size: {size:,}  |  Exch: {exch}\n"
+                                f"Conditions: [{conds_label}] — Option-Related QCT\n"
+                                f"Distance from current range: **${orqct_distance:.2f}**\n"
+                                f"Prev range: [{prev_low}, {prev_high}]  |  "
+                                f"Current range: [{compare_low}, {compare_high}]\n"
+                                f"Sequence: {sequence}  |  TRF ID: {trf_id}"
+                            )
+                            asyncio.create_task(send_discord(orqct_phantom_msg))
+                            asyncio.create_task(send_discord_phantom(orqct_phantom_msg))  # duplicate to phantom channel
+
+                            # Log to phantom tracker so it appears in EOD summary and CSV.
+                            # Skip during the 4:00–4:05 AM overnight carryover flush window.
+                            if not (time(4, 0) <= tm < time(4, 5)):
+                                orqct_phantom_trade_data = {
+                                    'price': price,
+                                    'size': size,
+                                    'exchange': exch,
+                                    'conditions': conds,
+                                    'sequence': sequence,
+                                    'sip_timestamp': sip_ts_raw,
+                                    'trf_timestamp': trf_ts_raw,
+                                    'trf_id': trf_id
+                                }
+                                orqct_phantom_record = phantom_tracker.log_phantom_print(orqct_phantom_trade_data, orqct_distance)
+                                asyncio.create_task(phantom_tracker.queue_for_alert(orqct_phantom_record))
 
                         # Phantom alert handling (is_phantom was already calculated earlier before range updates)
                         if is_phantom:
